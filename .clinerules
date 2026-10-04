@@ -1,0 +1,20 @@
+# Monitora_DG — regras do projeto
+
+1. Não reintroduzir Adafruit IO.
+2. Não reintroduzir o sensor de temperatura.
+3. Não reintroduzir o mecanismo antigo de reset via feed.
+4. Não bloquear o monitoramento dos GPIOs por operações de rede.
+5. Mudanças de estado dos GPIOs devem ser persistidas antes de operações de rede.
+6. O estado persistente deve sobreviver a reinicializações e quedas durante uma gravação.
+7. Telegram:
+   - queda: apagar sticker de queda anterior, enviar Oliver e guardar novo ID;
+   - retorno: enviar Huno sem apagar/substituir o sticker de queda;
+   - textos nunca são apagados.
+8. Preservar exatamente as listas de adjetivos e verbos existentes, com seleção aleatória sem repetição dentro do ciclo.
+9. ThingsBoard é o destino de telemetria.
+10. Não criar dependência de ER605, Vivo, Claro, Deco, Cloudflare ou outro equipamento/serviço específico.
+11. Credenciais reais nunca entram no código versionado.
+12. Respeitar o .clang-format adotado pelo projeto principal: LLVM, IndentWidth 3, ColumnLimit 160.
+13. Manter .pio/ fora do Git e local a cada computador.
+14. Alterações grandes devem ser divididas em commits pequenos e verificáveis.
+15. Antes de alterar arquitetura, explicar o motivo e o impacto.
