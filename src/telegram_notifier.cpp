@@ -91,6 +91,8 @@ void TelegramNotifier::onBootReturnReconstruction(const Timestamp &ts) {
    state_->tgPending = true;
    state_->tgTimestamp = ts;
    state_->tgForceNotify = true;
+   // A mandatory RETORNO must not inherit an incompatible FALTA phase.
+   state_->tgPhase = TG_PHASE_NONE;
 }
 
 void TelegramNotifier::update() {
@@ -162,16 +164,26 @@ void TelegramNotifier::finishSequence(bool deliveredValue) {
 }
 
 void TelegramNotifier::stepDelOld() {
+   // Only clear an id once Telegram confirmed the deletion; otherwise keep the
+   // id, stay in DEL_OLD and retry later.
    if (state_->lastFallStickerId > 0) {
-      telegram_->deleteMessage(state_->lastFallStickerId);
+      if (!telegram_->deleteMessage(state_->lastFallStickerId)) {
+         return;
+      }
+
+      state_->lastFallStickerId = 0;
+      save();
    }
 
    if (state_->lastReturnStickerId > 0) {
-      telegram_->deleteMessage(state_->lastReturnStickerId);
+      if (!telegram_->deleteMessage(state_->lastReturnStickerId)) {
+         return;
+      }
+
+      state_->lastReturnStickerId = 0;
+      save();
    }
 
-   state_->lastFallStickerId = 0;
-   state_->lastReturnStickerId = 0;
    state_->tgPhase = TG_PHASE_SEND_FALL;
    save();
 }

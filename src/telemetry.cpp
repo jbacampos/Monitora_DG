@@ -61,15 +61,19 @@ bool Telemetry::publish(const char *topic, const char *payload) {
 bool Telemetry::publishEvent(const PendingRecord &record) {
    const PowerState &s = record.power;
 
+   // ThingsBoard historical telemetry uses the { "ts": ..., "values": {...} } form.
+   // ts is the ORIGINAL event time (never the transmission time).
    if (record.timestamp.kind == TsKind::Epoch) {
       const unsigned long long ms = static_cast<unsigned long long>(record.timestamp.value) * 1000ULL;
 
-      snprintf(payloadBuffer, sizeof(payloadBuffer), "{\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%llu}", KEY_REDE_DISP, s.redeDisponivel ? 1 : 0, KEY_ALIM_REDE, s.alimentacaoRede ? 1 : 0,
-               KEY_ALIM_OFFGRID, s.alimentacaoOffgrid ? 1 : 0, KEY_ALIM_GERADOR, s.alimentacaoGerador ? 1 : 0, KEY_TS, ms);
+      snprintf(payloadBuffer, sizeof(payloadBuffer), "{\"%s\":%llu,\"values\":{\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d}}", KEY_TS, ms, KEY_REDE_DISP,
+               s.redeDisponivel ? 1 : 0, KEY_ALIM_REDE, s.alimentacaoRede ? 1 : 0, KEY_ALIM_OFFGRID, s.alimentacaoOffgrid ? 1 : 0, KEY_ALIM_GERADOR,
+               s.alimentacaoGerador ? 1 : 0);
    } else {
       // LostSession: the absolute time is unknown. Never fabricate an epoch.
-      snprintf(payloadBuffer, sizeof(payloadBuffer), "{\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":true}", KEY_REDE_DISP, s.redeDisponivel ? 1 : 0, KEY_ALIM_REDE,
-               s.alimentacaoRede ? 1 : 0, KEY_ALIM_OFFGRID, s.alimentacaoOffgrid ? 1 : 0, KEY_ALIM_GERADOR, s.alimentacaoGerador ? 1 : 0, KEY_TS_UNKNOWN);
+      snprintf(payloadBuffer, sizeof(payloadBuffer), "{\"%s\":true,\"values\":{\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d}}", KEY_TS_UNKNOWN, KEY_REDE_DISP,
+               s.redeDisponivel ? 1 : 0, KEY_ALIM_REDE, s.alimentacaoRede ? 1 : 0, KEY_ALIM_OFFGRID, s.alimentacaoOffgrid ? 1 : 0, KEY_ALIM_GERADOR,
+               s.alimentacaoGerador ? 1 : 0);
    }
 
    return publish(TB_TELEMETRY_TOPIC, payloadBuffer);

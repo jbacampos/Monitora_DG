@@ -1,5 +1,6 @@
 #include "state_store.h"
 
+#include <Arduino.h>
 #include <LittleFS.h>
 
 #include "config.h"
@@ -34,11 +35,10 @@ bool writeReplacing(const char *tmpPath, const char *finalPath, const void *data
 
 bool StateStore::begin() {
    if (!LittleFS.begin()) {
-      LittleFS.format();
-
-      if (!LittleFS.begin()) {
-         return false;
-      }
+      // A mount failure is NEVER permission to format: formatting would destroy
+      // state.bin and pending.bin (the persisted state and history).
+      Serial.println("ERRO: falha ao montar LittleFS (sem formatacao automatica).");
+      return false;
    }
 
    // An orphan temp file must never prevent normal operation.

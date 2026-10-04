@@ -65,6 +65,10 @@ struct PendingRecord {
    PowerState power{};
 };
 
+// Guard against an accidental future change of the on-flash record layout.
+// Expected: Timestamp 8 bytes + PowerState 4 bytes = 12 bytes.
+static_assert(sizeof(PendingRecord) == 12, "PendingRecord size changed");
+
 inline bool samePowerState(const PowerState &a, const PowerState &b) {
    return a.redeDisponivel == b.redeDisponivel && a.alimentacaoRede == b.alimentacaoRede && a.alimentacaoOffgrid == b.alimentacaoOffgrid &&
           a.alimentacaoGerador == b.alimentacaoGerador;

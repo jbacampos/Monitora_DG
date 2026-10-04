@@ -76,3 +76,66 @@ Campos do `DIAG`: `up` (uptime s), `wifi`, `rssi`, `ntp`, `rede`, `pend` (n pend
 
 - Sem Wi-Fi: GPIO continua; transicoes continuam persistidas (`pend` cresce); ao voltar
   o Wi-Fi os eventos sao publicados.
+## Rodada corretiva - testes especificos
+
+### Teste 1 - Payload historico do ThingsBoard
+
+1. Com NTP sincronizado, provoque uma transicao qualquer.
+2. Observe o payload publicado em `v1/devices/me/telemetry`.
+3. Confirmar que o formato e:
+
+```json
+{
+    "ts": 1700000000000,
+    "values": {
+        "rede_disponivel": 1,
+        "alimentacao_rede": 0,
+        "alimentacao_offgrid": 1,
+        "alimentacao_gerador": 0
+    }
+}
+```
+
+4. `ts` no nivel externo, em **milissegundos**.
+5. O `ts` corresponde ao momento do **evento**, nao ao momento da transmissao
+   (teste com o TB off-line: reconecte e confirme que o `ts` e o antigo).
+
+### Teste 2 - LostSession
+
+1. Gerar um evento antes do NTP (`SessionMillis`).
+2. Reiniciar antes da sincronizacao.
+3. No boot, confirmar que o registro vira `LostSession` (sem conversao para epoch).
+4. Ao publicar, o payload contem `"ts_unknown": true` e **nao** contem `"ts"`.
+
+### Teste 3 - Caso C com fase antiga
+
+1. Forcar um `state.bin` representando `redeDisponivel = NAO` com
+   `tgPhase = TG_PHASE_DEL_OLD` (fase antiga de FALTA) e `tgPending` verdadeiro.
+2. Iniciar com `redeDisponivel = SIM` no fisico.
+3. Confirmar: caso C reconhecido; `tgForce` = 1; a fase antiga de FALTA nao e
+   executada; a sequencia e `SEND_RET` e depois `TEXT_RET`; `tgNotifiedRede` nao
+   suprime o RETORNO obrigatorio.
+
+### Teste 4 - Falha no delete dos stickers
+
+1. Forcar falha de `deleteMessage()` (ex.: derrubar a rede durante `DEL_OLD`).
+2. Confirmar: `fallId`/`retId` continuam persistidos; `tgPhase` continua `del_old`;
+   nao avanca para `send_fall`; o retry ocorre na proxima tentativa.
+3. Restaurar a rede e confirmar: o ID e zerado e a fase avanca para `send_fall`.
+
+### Teste 5 - Falha de montagem da LittleFS
+
+1. Simular falha de montagem (FS corrompido / particao invalida).
+2. Confirmar: **nao** ocorre `LittleFS.format()`; `state.bin` e `pending.bin`
+   permanecem intactos; o Serial registra `ERRO: falha ao montar LittleFS`.
+
+### Teste 6 - Alive (escrita unica)
+
+1. Inspecionar `updateAlive()` em `src/main.cpp`.
+2. Confirmar que existe **uma unica** chamada `saveState()` por atualizacao de alive.
+
+### Teste 7 - Tamanho do PendingRecord
+
+1. `static_assert(sizeof(PendingRecord) == 12, ...)` presente em `include/types.h`.
+2. `pio run` compila com SUCCESS (o static_assert e verificado na compilacao).
+3. Estimativa de capacidade: 12 B/registro => ~43.000 registros em 512 KiB (inalterada).
