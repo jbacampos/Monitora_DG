@@ -1,7 +1,9 @@
 #include <Arduino.h>
+#include <ESP8266WiFi.h>
 
 #include "config.h"
 #include "input_monitor.h"
+#include "ota.h"
 #include "secrets.h"
 #include "state_store.h"
 #include "tb_queue.h"
@@ -21,12 +23,14 @@ namespace {
    Telemetry telemetry;
    Telegram telegram;
    TelegramNotifier notifier;
+   Ota ota;
 
    PersistedState persisted{};
 
    uint32_t lastSample = 0;
    uint32_t lastAlive = 0;
    uint32_t lastSavedHead = 0;
+   uint32_t lastDiag = 0;
 
    void saveState() {
       stateStore.save(persisted);
@@ -46,7 +50,6 @@ namespace {
    void handleTransition(const PowerState &current, const Timestamp &ts) {
       const bool redeChanged = current.redeDisponivel != persisted.power.redeDisponivel;
 
-      // Persist BEFORE any network operation.
       enqueue(current, ts);
       persisted.power = current;
 
@@ -188,8 +191,61 @@ namespace {
       }
    }
 
+   void handleTelegramCommands(uint32_t now) {
+      telegram.update(now);
+
+      if (telegram.commandOtaRequested()) {
+         Serial.println("Comando /ota recebido.");
+         telegram.sendText("Comando /ota recebido. Executando atualizacao.");
+         ota.run();
+      }
+
+      if (telegram.commandRebootRequested()) {
+         Serial.println("Comando /reboot recebido.");
+         telegram.sendText("Comando /reboot recebido. Reiniciando.");
+         delay(100);
+         ESP.restart();
+      }
+   }
+
+   const char *phaseName(uint8_t phase) {
+      switch (phase) {
+         case TG_PHASE_NONE:
+            return "none";
+         case TG_PHASE_DEL_OLD:
+            return "del_old";
+         case TG_PHASE_SEND_FALL:
+            return "send_fall";
+         case TG_PHASE_TEXT_FALL:
+            return "text_fall";
+         case TG_PHASE_SEND_RET:
+            return "send_ret";
+         case TG_PHASE_TEXT_RET:
+            return "text_ret";
+         default:
+            return "?";
+      }
+   }
+
    void printState(const char *prefix, const PowerState &s) {
       Serial.printf("%s rede=%d alim_rede=%d offgrid=%d gerador=%d\n", prefix, s.redeDisponivel, s.alimentacaoRede, s.alimentacaoOffgrid, s.alimentacaoGerador);
+   }
+
+   void printDiagnostics(uint32_t now) {
+      if ((now - lastDiag) < DIAGNOSTIC_INTERVAL_MS) {
+         return;
+      }
+
+      lastDiag = now;
+
+      const uint32_t count = tbQueue.count();
+
+      Serial.printf("DIAG up=%lus wifi=%d rssi=%d ntp=%d rede=%d pend=%lu head=%lu gap=%u tgPend=%d tgNotif=%d tgForce=%d tgPhase=%s fallId=%ld retId=%ld\n",
+                    static_cast<unsigned long>(now / 1000UL), WiFi.status() == WL_CONNECTED ? 1 : 0, WiFi.RSSI(), timeSource.synced() ? 1 : 0,
+                    persisted.power.redeDisponivel ? 1 : 0, static_cast<unsigned long>(count - persisted.tbLogHead),
+                    static_cast<unsigned long>(persisted.tbLogHead), persisted.tbGapCount, persisted.tgPending ? 1 : 0, persisted.tgNotifiedRede ? 1 : 0,
+                    persisted.tgForceNotify ? 1 : 0, phaseName(persisted.tgPhase), static_cast<long>(persisted.lastFallStickerId),
+                    static_cast<long>(persisted.lastReturnStickerId));
    }
 } // namespace
 
@@ -236,6 +292,7 @@ void setup() {
    telegram.begin();
    notifier.begin(&telegram, &stateStore, &persisted);
    telemetry.begin();
+   ota.begin();
 
    reconcileBoot();
 
@@ -279,8 +336,10 @@ void loop() {
    publishPendingTb();
 
    notifier.update();
+   handleTelegramCommands(now);
 
    updateAlive(now);
+   printDiagnostics(now);
 
    yield();
 }

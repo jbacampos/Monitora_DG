@@ -7,9 +7,10 @@
 5. Mudanças de estado dos GPIOs devem ser persistidas antes de operações de rede.
 6. O estado persistente deve sobreviver a reinicializações e quedas durante uma gravação.
 7. Telegram:
-   - queda: apagar sticker de queda anterior, enviar Oliver e guardar novo ID;
-   - retorno: enviar Huno sem apagar/substituir o sticker de queda;
-   - textos nunca são apagados.
+   - FALTA: apagar TODOS os stickers do ciclo anterior (o FALTA anterior e o RETORNO anterior, se existir), enviar o novo sticker de FALTA (Oliver), persistir o novo ID e enviar o texto;
+   - RETORNO: enviar o sticker de RETORNO (Huno) sem apagar nem substituir o sticker de FALTA, persistir o ID e enviar o texto;
+   - textos nunca são apagados;
+   - as fases da operação devem ser persistidas para retomar após reboot.
 8. Preservar exatamente as listas de adjetivos e verbos existentes, com seleção aleatória sem repetição dentro do ciclo.
 9. ThingsBoard é o destino de telemetria.
 10. Não criar dependência de ER605, Vivo, Claro, Deco, Cloudflare ou outro equipamento/serviço específico.
@@ -18,3 +19,5 @@
 13. Manter .pio/ fora do Git e local a cada computador.
 14. Alterações grandes devem ser divididas em commits pequenos e verificáveis.
 15. Antes de alterar arquitetura, explicar o motivo e o impacto.
+16. Timestamps usam TsKind (Epoch/SessionMillis/LostSession); nunca tratar millis() como Unix epoch.
+17. Persistência sem CRC e sem slots A/B nesta versão (state.bin via temp + rename; pending.bin append-only).
