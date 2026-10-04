@@ -5,6 +5,8 @@
 #include "secrets.h"
 #include "state_store.h"
 #include "tb_queue.h"
+#include "telegram.h"
+#include "telegram_notifier.h"
 #include "telemetry.h"
 #include "time_source.h"
 #include "types.h"
@@ -17,6 +19,8 @@ namespace {
    StateStore stateStore;
    TbQueue tbQueue;
    Telemetry telemetry;
+   Telegram telegram;
+   TelegramNotifier notifier;
 
    PersistedState persisted{};
 
@@ -40,9 +44,16 @@ namespace {
    }
 
    void handleTransition(const PowerState &current, const Timestamp &ts) {
+      const bool redeChanged = current.redeDisponivel != persisted.power.redeDisponivel;
+
       // Persist BEFORE any network operation.
       enqueue(current, ts);
       persisted.power = current;
+
+      if (redeChanged) {
+         notifier.onRedeTransition(ts);
+      }
+
       saveState();
    }
 
@@ -67,13 +78,30 @@ namespace {
       const bool before = persisted.power.redeDisponivel;
       const bool after = actual.redeDisponivel;
 
+      Timestamp reconstructed{};
+      bool hasReconstruction = false;
+      bool reconstructReturn = false;
+
       if (before && !after) {
-         enqueue(actual, persisted.alive.timestamp); // CASE B
+         reconstructed = persisted.alive.timestamp; // CASE B
+         hasReconstruction = true;
       } else if (!before && after) {
-         enqueue(actual, timeSource.now()); // CASE C
+         reconstructed = timeSource.now(); // CASE C
+         hasReconstruction = true;
+         reconstructReturn = true;
       }
 
       persisted.power = actual;
+
+      if (hasReconstruction) {
+         enqueue(actual, reconstructed);
+
+         if (reconstructReturn) {
+            notifier.onBootReturnReconstruction(reconstructed);
+         } else {
+            notifier.onRedeTransition(reconstructed);
+         }
+      }
 
       if (actual.redeDisponivel) {
          persisted.alive.timestamp = timeSource.now();
@@ -108,7 +136,6 @@ namespace {
 
       if (persisted.tbLogHead >= count) {
          if (count > 0) {
-            // Fully drained: compact once.
             tbQueue.reset();
             persisted.tbLogHead = 0;
             lastSavedHead = 0;
@@ -123,7 +150,6 @@ namespace {
          return;
       }
 
-      // Never transmit a session-relative value as if it were absolute.
       if (record.timestamp.kind == TsKind::SessionMillis) {
          return;
       }
@@ -207,6 +233,8 @@ void setup() {
    }
 
    wifi.begin();
+   telegram.begin();
+   notifier.begin(&telegram, &stateStore, &persisted);
    telemetry.begin();
 
    reconcileBoot();
@@ -228,7 +256,6 @@ void loop() {
       onTimeSynced();
    }
 
-   // GPIO monitoring has priority over every network operation.
    if ((now - lastSample) >= INPUT_SAMPLE_MS) {
       lastSample = now;
       inputs.update(now);
@@ -250,6 +277,8 @@ void loop() {
    const uint32_t aliveEpoch = timeSource.synced() ? timeSource.now().value : 0;
    telemetry.publishHeartbeat(now, aliveEpoch);
    publishPendingTb();
+
+   notifier.update();
 
    updateAlive(now);
 
