@@ -10,11 +10,105 @@
 namespace {
    constexpr char TELEGRAM_HOST[] = "api.telegram.org";
 
-   // Diagnostic-only: prints the elapsed time of every Telegram HTTP request.
-   // Does not change any control flow or API.
-   void httpLog(const char *method, bool ok, uint32_t start) {
-      Serial.printf("[%lu] TG HTTP: %s fim ok=%d duracao=%lums\n", static_cast<unsigned long>(millis()), method, ok ? 1 : 0,
-                    static_cast<unsigned long>(millis() - start));
+   constexpr size_t TG_DIAG_BODY_MAX = 160;
+   constexpr size_t TG_DIAG_DESC_MAX = 120;
+
+   // Diagnostic-only: elapsed milliseconds since "start".
+   uint32_t elapsedMs(uint32_t start) {
+      return static_cast<uint32_t>(millis() - start);
+   }
+
+   // Diagnostic-only: bounded, single-line view of a raw HTTP body snippet.
+   // CR/LF become spaces so the whole snippet stays on one Serial line.
+   String diagBody(const String &body) {
+      String out = body.substring(0, TG_DIAG_BODY_MAX);
+      out.replace("\r", " ");
+      out.replace("\n", " ");
+      return out;
+   }
+
+   // Diagnostic-only: numeric HTTP status, or 0 when there is no HTTP status
+   // line. Never touches the URL/token.
+   int diagHttpStatus(const String &response) {
+      if (response.length() < 12 || response.indexOf("HTTP/") != 0) {
+         return 0;
+      }
+
+      const int sp = response.indexOf(' ');
+
+      if (sp < 0 || sp + 4 > static_cast<int>(response.length())) {
+         return 0;
+      }
+
+      return response.substring(sp + 1, sp + 4).toInt();
+   }
+
+   // Diagnostic-only: clock + duration wrapper for the per-request summary.
+   void httpLog(const char *method, bool ok, int http, uint32_t start) {
+      Serial.printf("[%lu] TG HTTP: %s fim ok=%d http=%d duracao=%lums\n", static_cast<unsigned long>(millis()), method, ok ? 1 : 0, http,
+                    static_cast<unsigned long>(elapsedMs(start)));
+   }
+
+   // Diagnostic-only: the request failed before any HTTP reply was read, so the
+   // transport state is made explicit.
+   void httpTransportLog(const char *method, const char *state, uint32_t start) {
+      Serial.printf("[%lu] TG HTTP: %s transporte=%s http=0 duracao=%lums\n", static_cast<unsigned long>(millis()), method, state,
+                    static_cast<unsigned long>(elapsedMs(start)));
+   }
+
+   // Diagnostic-only: what Telegram actually answered. Prints the parsed
+   // api ok / error_code / description, a bounded body snippet, or a compact
+   // line for large replies (getUpdates). Never prints the token or the URL.
+   void httpResponseLog(const char *method, const String &response, int http, uint32_t start) {
+      const uint32_t dur = elapsedMs(start);
+
+      // getUpdates replies can be large; keep them to a compact line only.
+      if (String(method) == "getUpdates") {
+         Serial.printf("[%lu] TG HTTP: %s transporte=OK http=%d duracao=%lums\n", static_cast<unsigned long>(millis()), method, http,
+                       static_cast<unsigned long>(dur));
+         return;
+      }
+
+      if (response.isEmpty()) {
+         Serial.printf("[%lu] TG HTTP: %s transporte=OK http=%d body=<vazio> duracao=%lums\n", static_cast<unsigned long>(millis()), method, http,
+                       static_cast<unsigned long>(dur));
+         return;
+      }
+
+      const int jsonStart = response.indexOf("{\"ok\"");
+
+      if (jsonStart < 0) {
+         Serial.printf("[%lu] TG HTTP: %s transporte=OK http=%d api_ok=? body=\"%s\" duracao=%lums\n", static_cast<unsigned long>(millis()), method, http,
+                       diagBody(response).c_str(), static_cast<unsigned long>(dur));
+         return;
+      }
+
+      DynamicJsonDocument doc(2048);
+
+      const DeserializationError err = deserializeJson(doc, response.substring(jsonStart));
+
+      if (err) {
+         Serial.printf("[%lu] TG HTTP: %s http=%d api_ok=? json_erro=%s body=\"%s\" duracao=%lums\n", static_cast<unsigned long>(millis()), method, http, err.c_str(),
+                       diagBody(response).c_str(), static_cast<unsigned long>(dur));
+         return;
+      }
+
+      const bool apiOk = doc["ok"] | false;
+
+      if (apiOk) {
+         Serial.printf("[%lu] TG HTTP: %s transporte=OK http=%d api_ok=1 duracao=%lums\n", static_cast<unsigned long>(millis()), method, http,
+                       static_cast<unsigned long>(dur));
+         return;
+      }
+
+      const int errCode = doc["error_code"] | 0;
+      String desc = doc["description"] | "";
+
+      desc.replace("\r", " ");
+      desc.replace("\n", " ");
+
+      Serial.printf("[%lu] TG HTTP: %s transporte=OK http=%d api_ok=0 error_code=%d description=\"%s\" duracao=%lums\n", static_cast<unsigned long>(millis()), method,
+                    http, errCode, desc.substring(0, TG_DIAG_DESC_MAX).c_str(), static_cast<unsigned long>(dur));
    }
 } // namespace
 
@@ -61,7 +155,8 @@ bool Telegram::request(
    Serial.printf("[%lu] TG HTTP: %s inicio\n", static_cast<unsigned long>(httpStart), method.c_str());
 
    if (WiFi.status() != WL_CONNECTED) {
-      httpLog(method.c_str(), false, httpStart);
+      httpLog(method.c_str(), false, 0, httpStart);
+      httpTransportLog(method.c_str(), "NO_WIFI", httpStart);
       return false;
    }
 
@@ -70,7 +165,8 @@ bool Telegram::request(
    client.setTimeout(TELEGRAM_RESPONSE_TIMEOUT_MS);
 
    if (!client.connect(TELEGRAM_HOST, 443)) {
-      httpLog(method.c_str(), false, httpStart);
+      httpLog(method.c_str(), false, 0, httpStart);
+      httpTransportLog(method.c_str(), "CONNECT_FAIL", httpStart);
       return false;
    }
 
@@ -94,7 +190,8 @@ bool Telegram::request(
 
    if (!client.available()) {
       client.stop();
-      httpLog(method.c_str(), false, httpStart);
+      httpLog(method.c_str(), false, 0, httpStart);
+      httpTransportLog(method.c_str(), "NO_DATA_TIMEOUT", httpStart);
       return false;
    }
 
@@ -111,8 +208,10 @@ bool Telegram::request(
    client.stop();
 
    const bool ok = response.indexOf("{\"ok\"") >= 0;
+   const int http = diagHttpStatus(response);
 
-   httpLog(method.c_str(), ok, httpStart);
+   httpLog(method.c_str(), ok, http, httpStart);
+   httpResponseLog(method.c_str(), response, http, httpStart);
 
    return ok;
 }
@@ -161,11 +260,18 @@ bool Telegram::sendSticker(const String &stickerId, int32_t &messageId) {
    }
 
    messageId = doc["result"]["message_id"] | 0;
+
+   // Diagnostic-only: confirm the exact API field that feeds lastFallStickerId /
+   // lastReturnStickerId in TelegramNotifier.
+   Serial.printf("[%lu] TG: sendSticker result.message_id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
+
    return messageId > 0;
 }
 
 bool Telegram::deleteMessage(int32_t messageId) {
    if (messageId <= 0) {
+      // Diagnostic-only: the id handed to the API was not usable.
+      Serial.printf("[%lu] TG: deleteMessage id_invalido=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
       return false;
    }
 
@@ -182,10 +288,17 @@ bool Telegram::deleteMessage(int32_t messageId) {
    DynamicJsonDocument doc(1024);
 
    if (deserializeJson(doc, response.substring(response.indexOf("{\"ok\"")))) {
+      // Diagnostic-only: the reply body was not parseable JSON.
+      Serial.printf("[%lu] TG: deleteMessage json_nao_parseavel id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
       return false;
    }
 
-   return doc["ok"] | false;
+   const bool apiOk = doc["ok"] | false;
+
+   // Diagnostic-only: the parsed API verdict for this deletion.
+   Serial.printf("[%lu] TG: deleteMessage resultado_api ok=%d id=%ld\n", static_cast<unsigned long>(millis()), apiOk ? 1 : 0, static_cast<long>(messageId));
+
+   return apiOk;
 }
 
 void Telegram::processUpdates(const String &response) {

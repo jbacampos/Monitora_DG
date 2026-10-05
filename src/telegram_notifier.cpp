@@ -266,8 +266,8 @@ void TelegramNotifier::stepSendFall() {
 
    const bool ok = telegram_->sendSticker(TELEGRAM_OLI_STICKER, messageId);
 
-   Serial.printf("[%lu] TG: SEND_FALL resultado=%s id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA", static_cast<long>(messageId),
-                 static_cast<unsigned long>(millis() - tSend));
+   Serial.printf("[%lu] TG: SEND_FALL resultado=%s message_id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
+                 static_cast<long>(messageId), static_cast<unsigned long>(millis() - tSend));
 
    if (!ok) {
       return; // retry later
@@ -305,8 +305,8 @@ void TelegramNotifier::stepSendRet() {
 
    const bool ok = telegram_->sendSticker(TELEGRAM_HUNO_STICKER, messageId);
 
-   Serial.printf("[%lu] TG: SEND_RET resultado=%s id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA", static_cast<long>(messageId),
-                 static_cast<unsigned long>(millis() - tSend));
+   Serial.printf("[%lu] TG: SEND_RET resultado=%s message_id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
+                 static_cast<long>(messageId), static_cast<unsigned long>(millis() - tSend));
 
    if (!ok) {
       return;
