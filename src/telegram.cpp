@@ -175,6 +175,12 @@ bool Telegram::request(
    client.setInsecure();
    client.setTimeout(TELEGRAM_RESPONSE_TIMEOUT_MS);
 
+   // BearSSL I/O buffers for this per-call Telegram TLS client. Default is
+   // setBufferSizes(16384, 512) -> 16709 B (in) + 597 B (out); the Telegram
+   // requests/responses are small, so 4096 payload bytes (-> 4421 + 597 B) fit
+   // alongside the ThingsBoard TLS client.
+   client.setBufferSizes(4096, 512);
+
    heapLog(method.c_str(), "pre-connect");
 
    if (!client.connect(TELEGRAM_HOST, 443)) {
