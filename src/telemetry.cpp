@@ -103,7 +103,15 @@ void Telemetry::update(uint32_t now) {
 
       if ((now - lastMqttAttempt_) >= MQTT_RECONNECT_MS) {
          lastMqttAttempt_ = now;
-         connectMqtt();
+
+         const uint32_t tbStart = millis();
+
+         Serial.printf("[%lu] TB: connect inicio\n", static_cast<unsigned long>(tbStart));
+
+         const bool ok = connectMqtt();
+
+         Serial.printf("[%lu] TB: connect fim ok=%d duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? 1 : 0,
+                       static_cast<unsigned long>(millis() - tbStart));
       }
 
       return;

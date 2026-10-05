@@ -40,6 +40,10 @@ private:
    size_t failurePosition_ = kFailureVerbCount;
    size_t returnPosition_ = kReturnVerbCount;
 
+   // Diagnostic-only: millis() when the current Telegram sequence started.
+   // Never persisted, never used for control flow.
+   uint32_t seqStartMillis_ = 0;
+
    void save();
    void startSequence();
    void pickIndices(bool returnOfEnergy);

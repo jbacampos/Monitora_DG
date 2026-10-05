@@ -9,7 +9,14 @@
 
 namespace {
    constexpr char TELEGRAM_HOST[] = "api.telegram.org";
-}
+
+   // Diagnostic-only: prints the elapsed time of every Telegram HTTP request.
+   // Does not change any control flow or API.
+   void httpLog(const char *method, bool ok, uint32_t start) {
+      Serial.printf("[%lu] TG HTTP: %s fim ok=%d duracao=%lums\n", static_cast<unsigned long>(millis()), method, ok ? 1 : 0,
+                    static_cast<unsigned long>(millis() - start));
+   }
+} // namespace
 
 bool Telegram::begin() {
    lastPoll_ = 0;
@@ -49,7 +56,12 @@ bool Telegram::request(
    const String &query,
    String &response) {
 
+   const uint32_t httpStart = millis();
+
+   Serial.printf("[%lu] TG HTTP: %s inicio\n", static_cast<unsigned long>(httpStart), method.c_str());
+
    if (WiFi.status() != WL_CONNECTED) {
+      httpLog(method.c_str(), false, httpStart);
       return false;
    }
 
@@ -58,6 +70,7 @@ bool Telegram::request(
    client.setTimeout(TELEGRAM_RESPONSE_TIMEOUT_MS);
 
    if (!client.connect(TELEGRAM_HOST, 443)) {
+      httpLog(method.c_str(), false, httpStart);
       return false;
    }
 
@@ -81,6 +94,7 @@ bool Telegram::request(
 
    if (!client.available()) {
       client.stop();
+      httpLog(method.c_str(), false, httpStart);
       return false;
    }
 
@@ -96,7 +110,11 @@ bool Telegram::request(
 
    client.stop();
 
-   return response.indexOf("{\"ok\"") >= 0;
+   const bool ok = response.indexOf("{\"ok\"") >= 0;
+
+   httpLog(method.c_str(), ok, httpStart);
+
+   return ok;
 }
 
 bool Telegram::sendText(const String &message) {

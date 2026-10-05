@@ -49,11 +49,19 @@ namespace {
 
    void handleTransition(const PowerState &current, const Timestamp &ts) {
       const bool redeChanged = current.redeDisponivel != persisted.power.redeDisponivel;
+      const bool previousRede = persisted.power.redeDisponivel;
 
       enqueue(current, ts);
       persisted.power = current;
 
       if (redeChanged) {
+         const uint32_t tNow = millis();
+
+         Serial.printf("[%lu] TG: TRANSICAO rede=%d\n", static_cast<unsigned long>(tNow), current.redeDisponivel ? 1 : 0);
+         Serial.printf("[%lu] TG: timestamp evento kind=%d value=%lu\n", static_cast<unsigned long>(tNow), static_cast<int>(ts.kind),
+                       static_cast<unsigned long>(ts.value));
+         Serial.printf("[%lu] TG: estado anterior=%d estado novo=%d\n", static_cast<unsigned long>(tNow), previousRede ? 1 : 0, current.redeDisponivel ? 1 : 0);
+
          notifier.onRedeTransition(ts);
       }
 
@@ -157,9 +165,20 @@ namespace {
          return;
       }
 
-      if (!telemetry.publishEvent(record)) {
+      const uint32_t tbStart = millis();
+
+      Serial.printf("[%lu] TB: publishPending inicio\n", static_cast<unsigned long>(tbStart));
+
+      const bool published = telemetry.publishEvent(record);
+
+      Serial.printf("[%lu] TB: publishPending fim duracao=%lums\n", static_cast<unsigned long>(millis()), static_cast<unsigned long>(millis() - tbStart));
+
+      if (!published) {
+         Serial.printf("[%lu] TB: falha de publicacao\n", static_cast<unsigned long>(millis()));
          return;
       }
+
+      Serial.printf("[%lu] TB: evento publicado\n", static_cast<unsigned long>(millis()));
 
       persisted.tbLogHead++;
 
@@ -306,12 +325,15 @@ void setup() {
 
 void loop() {
    const uint32_t now = millis();
+   const uint32_t loopStart = now;
 
    wifi.update(now);
+   const uint32_t afterWifi = millis();
 
    if (timeSource.update()) {
       onTimeSynced();
    }
+   const uint32_t afterNtp = millis();
 
    if ((now - lastSample) >= INPUT_SAMPLE_MS) {
       lastSample = now;
@@ -328,18 +350,34 @@ void loop() {
          inputs.clearChanged();
       }
    }
+   const uint32_t afterSample = millis();
 
    telemetry.update(now);
 
    const uint32_t aliveEpoch = timeSource.synced() ? timeSource.now().value : 0;
    telemetry.publishHeartbeat(now, aliveEpoch);
    publishPendingTb();
+   const uint32_t afterTb = millis();
 
    notifier.update();
    handleTelegramCommands(now);
+   const uint32_t afterTg = millis();
 
    updateAlive(now);
    printDiagnostics(now);
+   const uint32_t afterMisc = millis();
 
    yield();
+   const uint32_t loopEnd = millis();
+
+   // Diagnostic-only: report abnormal cycles (and per-stage split) without
+   // changing the ordering or the logic of the loop.
+   const uint32_t loopDur = static_cast<uint32_t>(loopEnd - loopStart);
+
+   if (loopDur >= 500) {
+      Serial.printf("[%lu] LOOP: ciclo longo=%lums wifi=%lu ntp=%lu sample=%lu tb=%lu tg=%lu misc=%lu\n", static_cast<unsigned long>(loopEnd),
+                    static_cast<unsigned long>(loopDur), static_cast<unsigned long>(afterWifi - loopStart), static_cast<unsigned long>(afterNtp - afterWifi),
+                    static_cast<unsigned long>(afterSample - afterNtp), static_cast<unsigned long>(afterTb - afterSample),
+                    static_cast<unsigned long>(afterTg - afterTb), static_cast<unsigned long>(afterMisc - afterTg));
+   }
 }
