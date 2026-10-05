@@ -56,6 +56,15 @@ namespace {
                     static_cast<unsigned long>(elapsedMs(start)));
    }
 
+   // Diagnostic-only: heap snapshot around the TLS client lifecycle.
+   // free = ESP.getFreeHeap(), maxblock = ESP.getMaxFreeBlockSize(),
+   // frag = ESP.getHeapFragmentation() in %.
+   void heapLog(const char *method, const char *tag) {
+      Serial.printf("[%lu] TG HEAP: %s %s free=%u maxblock=%u frag=%u%%\n", static_cast<unsigned long>(millis()), method, tag,
+                    static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxFreeBlockSize()),
+                    static_cast<unsigned>(ESP.getHeapFragmentation()));
+   }
+
    // Diagnostic-only: what Telegram actually answered. Prints the parsed
    // api ok / error_code / description, a bounded body snippet, or a compact
    // line for large replies (getUpdates). Never prints the token or the URL.
@@ -154,6 +163,8 @@ bool Telegram::request(
 
    Serial.printf("[%lu] TG HTTP: %s inicio\n", static_cast<unsigned long>(httpStart), method.c_str());
 
+   heapLog(method.c_str(), "pre-new");
+
    if (WiFi.status() != WL_CONNECTED) {
       httpLog(method.c_str(), false, 0, httpStart);
       httpTransportLog(method.c_str(), "NO_WIFI", httpStart);
@@ -164,7 +175,10 @@ bool Telegram::request(
    client.setInsecure();
    client.setTimeout(TELEGRAM_RESPONSE_TIMEOUT_MS);
 
+   heapLog(method.c_str(), "pre-connect");
+
    if (!client.connect(TELEGRAM_HOST, 443)) {
+      heapLog(method.c_str(), "pos-connect-fail");
       httpLog(method.c_str(), false, 0, httpStart);
       httpTransportLog(method.c_str(), "CONNECT_FAIL", httpStart);
       return false;
@@ -190,6 +204,7 @@ bool Telegram::request(
 
    if (!client.available()) {
       client.stop();
+      heapLog(method.c_str(), "pos-close-nodata");
       httpLog(method.c_str(), false, 0, httpStart);
       httpTransportLog(method.c_str(), "NO_DATA_TIMEOUT", httpStart);
       return false;
@@ -207,11 +222,15 @@ bool Telegram::request(
 
    client.stop();
 
+   heapLog(method.c_str(), "pos-close");
+
    const bool ok = response.indexOf("{\"ok\"") >= 0;
    const int http = diagHttpStatus(response);
 
    httpLog(method.c_str(), ok, http, httpStart);
    httpResponseLog(method.c_str(), response, http, httpStart);
+
+   heapLog(method.c_str(), "pos-resposta");
 
    return ok;
 }
