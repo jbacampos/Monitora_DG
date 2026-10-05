@@ -2,6 +2,7 @@
 #include <ESP8266WiFi.h>
 
 #include "config.h"
+#include "heap_diag.h"
 #include "input_monitor.h"
 #include "ota.h"
 #include "secrets.h"
@@ -31,6 +32,9 @@ namespace {
    uint32_t lastAlive = 0;
    uint32_t lastSavedHead = 0;
    uint32_t lastDiag = 0;
+
+   // Diagnostic-only: edge detector so the Wi-Fi connect instant is logged once.
+   bool wifiConnectedLogged = false;
 
    void saveState() {
       stateStore.save(persisted);
@@ -190,6 +194,7 @@ namespace {
 
    void onTimeSynced() {
       Serial.println("NTP sincronizado.");
+      heapDiag("evento:ntp-sincronizado");
 
       if (tbQueue.resolveSessionTimestamps(timeSource, persisted.tbLogHead)) {
          Serial.println("Log TB: timestamps de sessao convertidos para Epoch.");
@@ -275,17 +280,28 @@ void setup() {
    Serial.println();
    Serial.println("Boot Monitora_DG");
 
+   heapDiag("setup:boot");
+
    if (!stateStore.begin()) {
       Serial.println("ERRO: LittleFS");
    }
 
+   heapDiag("setup:pos-littlefs");
+
    tbQueue.begin();
    tbQueue.invalidateSessionTimestamps();
+
+   heapDiag("setup:pos-tbqueue");
 
    const bool haveState = stateStore.load(persisted);
 
    inputs.begin();
+
+   heapDiag("setup:pos-gpio");
+
    timeSource.begin();
+
+   heapDiag("setup:pos-ntp-start");
 
    if (haveState) {
       const uint32_t count = tbQueue.count();
@@ -307,13 +323,25 @@ void setup() {
       Serial.println("Sem estado persistente (primeira inicializacao).");
    }
 
+   heapDiag("setup:pos-load");
+
    wifi.begin();
+
+   heapDiag("setup:pos-wifi-begin");
+
    telegram.begin();
+
+   heapDiag("setup:pos-telegram-begin");
+
    notifier.begin(&telegram, &stateStore, &persisted);
    telemetry.begin();
    ota.begin();
 
+   heapDiag("setup:pos-clients-begin");
+
    reconcileBoot();
+
+   heapDiag("setup:pos-reconcile");
 
    lastSample = millis();
    lastAlive = millis();
@@ -321,6 +349,8 @@ void setup() {
 
    printState("Estado inicial:", persisted.power);
    Serial.printf("Pendentes TB: %lu\n", static_cast<unsigned long>(tbQueue.count() - persisted.tbLogHead));
+
+   heapDiag("setup:fim");
 }
 
 void loop() {
@@ -328,6 +358,13 @@ void loop() {
    const uint32_t loopStart = now;
 
    wifi.update(now);
+
+   // Diagnostic-only: log the Wi-Fi connect instant once (rising edge).
+   if (!wifiConnectedLogged && WiFi.status() == WL_CONNECTED) {
+      wifiConnectedLogged = true;
+      heapDiag("evento:wifi-conectado");
+   }
+
    const uint32_t afterWifi = millis();
 
    if (timeSource.update()) {

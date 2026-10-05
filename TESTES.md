@@ -139,3 +139,34 @@ Campos do `DIAG`: `up` (uptime s), `wifi`, `rssi`, `ntp`, `rede`, `pend` (n pend
 1. `static_assert(sizeof(PendingRecord) == 12, ...)` presente em `include/types.h`.
 2. `pio run` compila com SUCCESS (o static_assert e verificado na compilacao).
 3. Estimativa de capacidade: 12 B/registro => ~43.000 registros em 512 KiB (inalterada).
+
+## Rodada de diagnostico - heap antes do Telegram
+
+Objetivo: descobrir onde o maior bloco livre cai para ~12 KB, antes de a primeira
+chamada TLS do Telegram precisar de 16709 bytes (`BR_SSL_BUFSIZE_MONO`).
+
+Instrumentacao (somente leitura do estado do heap, sem alterar comportamento):
+`include/heap_diag.h` -> `heapDiag(tag)` imprime, com prefixo `[millis()]`:
+`HEAP: <tag> free=... maxblock=... frag=...%`.
+
+Pontos registrados:
+- setup: `setup:boot`, `setup:pos-littlefs`, `setup:pos-tbqueue`, `setup:pos-load`,
+  `setup:pos-gpio`, `setup:pos-ntp-start`, `setup:pos-wifi-begin`,
+  `setup:pos-telegram-begin`, `setup:pos-clients-begin`, `setup:pos-reconcile`, `setup:fim`;
+- eventos: `evento:wifi-conectado` (borda), `evento:ntp-sincronizado`,
+  `evento:mqtt-conectado` / `evento:mqtt-falha`;
+- por requisicao Telegram (rodada anterior): `TG HEAP: <met> pre-new | pre-connect |
+  pos-connect-fail | pos-close | pos-resposta` (a primeira ocorrencia e a primeira chamada).
+
+Consumidores residentes relevantes (inspecao estatica):
+- `src/telemetry.cpp`: `WiFiClientSecure tlsClient` **persistente** (MQTT/ThingsBoard) ->
+  o BearSSL mantem ~16709 B (`_iobuf_in`) + 512 B (`_iobuf_out`) + contextos enquanto
+  conectado; mais `PubSubClient mqtt` (buffer de 384 B) e `char payloadBuffer[256]` (BSS).
+- `src/telegram.cpp`: cliente TLS **por chamada** (mesmo custo de ~16709 B, transitorio);
+  `DynamicJsonDocument` 2048/1024 e 8192 (getUpdates) transitorios.
+- `src/ota.cpp`: cliente TLS local (apenas durante OTA).
+- `src/main.cpp`: objetos de namespace (BSS, pequenos).
+
+Leitura esperada: o maior bloco deve cair de forma acentuada no `evento:mqtt-conectado`
+(quando o BearSSL do ThingsBoard passa a manter o buffer residente), antes de qualquer
+chamada do Telegram.

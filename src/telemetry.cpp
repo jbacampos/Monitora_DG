@@ -5,6 +5,7 @@
 #include <WiFiClientSecure.h>
 
 #include "config.h"
+#include "heap_diag.h"
 #include "secrets.h"
 
 namespace {
@@ -36,10 +37,12 @@ bool Telemetry::connectMqtt() {
 
    if (mqtt.connect(clientId.c_str(), TB_ACCESS_TOKEN, nullptr)) {
       connected_ = true;
+      heapDiag("evento:mqtt-conectado");
       return true;
    }
 
    connected_ = false;
+   heapDiag("evento:mqtt-falha");
    return false;
 }
 
