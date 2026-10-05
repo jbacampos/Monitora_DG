@@ -18,6 +18,12 @@ bool Telemetry::begin() {
    tlsClient.setInsecure();
    tlsClient.setTimeout(1500);
 
+   // BearSSL I/O buffers for the ThingsBoard TLS client. The firmware default is
+   // setBufferSizes(16384, 512) -> 16709 B (in) + 597 B (out); the MQTT payloads
+   // are tiny, so 4096 payload bytes (-> 4421 + 597 B) are enough and free the
+   // large contiguous block the Telegram TLS client needs.
+   tlsClient.setBufferSizes(4096, 512);
+
    mqtt.setServer(TB_HOST, TB_PORT);
    mqtt.setBufferSize(384);
 
