@@ -216,7 +216,15 @@ namespace {
    }
 
    void handleTelegramCommands(uint32_t now) {
-      telegram.update(now);
+      // While a notification sequence is in flight (tgPending with an active
+      // phase), its phases must run back to back: polling getUpdates() here would
+      // insert a full HTTPS round-trip between every step. Commands are still
+      // processed normally as soon as the sequence has finished (phase == NONE).
+      const bool notifying = persisted.tgPending && persisted.tgPhase != TG_PHASE_NONE;
+
+      if (!notifying) {
+         telegram.update(now);
+      }
 
       if (telegram.commandOtaRequested()) {
          Serial.println("Comando /ota recebido.");
