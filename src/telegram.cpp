@@ -323,7 +323,24 @@ bool Telegram::deleteMessage(int32_t messageId) {
    // Diagnostic-only: the parsed API verdict for this deletion.
    Serial.printf("[%lu] TG: deleteMessage resultado_api ok=%d id=%ld\n", static_cast<unsigned long>(millis()), apiOk ? 1 : 0, static_cast<long>(messageId));
 
-   return apiOk;
+   if (apiOk) {
+      return true;
+   }
+
+   // Telegram answers this specific error when the target message no longer
+   // exists: the deletion is already satisfied, so it counts as a logical success
+   // and TelegramNotifier::stepDelOld() clears the stored id and advances phase
+   // exactly as after a confirmed deletion. Every other outcome (other API error,
+   // other HTTP status, transport failure) keeps the current retry behaviour.
+   const int errorCode = doc["error_code"] | 0;
+   const String description = doc["description"] | "";
+
+   if (errorCode == 400 && description.indexOf("message to delete not found") >= 0) {
+      Serial.printf("[%lu] TG: deleteMessage ja_inexistente id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
+      return true;
+   }
+
+   return false;
 }
 
 void Telegram::processUpdates(const String &response) {
