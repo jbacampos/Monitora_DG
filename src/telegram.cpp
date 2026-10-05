@@ -27,22 +27,6 @@ namespace {
       return out;
    }
 
-   // Diagnostic-only: numeric HTTP status, or 0 when there is no HTTP status
-   // line. Never touches the URL/token.
-   int diagHttpStatus(const String &response) {
-      if (response.length() < 12 || response.indexOf("HTTP/") != 0) {
-         return 0;
-      }
-
-      const int sp = response.indexOf(' ');
-
-      if (sp < 0 || sp + 4 > static_cast<int>(response.length())) {
-         return 0;
-      }
-
-      return response.substring(sp + 1, sp + 4).toInt();
-   }
-
    // Diagnostic-only: clock + duration wrapper for the per-request summary.
    void httpLog(const char *method, bool ok, int http, uint32_t start) {
       Serial.printf("[%lu] TG HTTP: %s fim ok=%d http=%d duracao=%lums\n", static_cast<unsigned long>(millis()), method, ok ? 1 : 0, http,
@@ -63,6 +47,232 @@ namespace {
       Serial.printf("[%lu] TG HEAP: %s %s free=%u maxblock=%u frag=%u%%\n", static_cast<unsigned long>(millis()), method, tag,
                     static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxFreeBlockSize()),
                     static_cast<unsigned>(ESP.getHeapFragmentation()));
+   }
+
+   // ---------------------------------------------------------------------------
+   // Persistent Telegram TLS connection.
+   //
+   // Created on demand, reused by every Telegram request (getUpdates /
+   // deleteMessage / sendSticker / sendMessage) and closed explicitly by
+   // Telegram::closeConnection(). Requests use HTTP/1.1 keep-alive, so the end of
+   // each response is determined by its own framing (Content-Length or chunked)
+   // and never by the socket closing.
+   // ---------------------------------------------------------------------------
+   WiFiClientSecure *tgClient = nullptr;
+
+   // Diagnostic-only: connection lifecycle of the persistent TLS client.
+   void tlsLog(const char *state) {
+      Serial.printf("[%lu] TG TLS: %s\n", static_cast<unsigned long>(millis()), state);
+   }
+
+   // Stops and releases the persistent client (safe when none exists).
+   void dropTgConnection() {
+      if (tgClient != nullptr) {
+         tgClient->stop();
+         delete tgClient;
+         tgClient = nullptr;
+         tlsLog("conexao fechada");
+      }
+   }
+
+   // Overflow-safe absolute-deadline test.
+   bool tgExpired(uint32_t deadline) {
+      return static_cast<int32_t>(millis() - deadline) >= 0;
+   }
+
+   // Creates the persistent client when missing/dead, otherwise reuses it.
+   bool ensureConnection() {
+      if (tgClient != nullptr && tgClient->connected()) {
+         tlsLog("conexao reutilizada");
+         return true;
+      }
+
+      if (tgClient != nullptr) {
+         // The server (or the network) closed the previous connection.
+         tlsLog("reconectando");
+         dropTgConnection();
+      }
+
+      WiFiClientSecure *client = new WiFiClientSecure();
+
+      client->setInsecure();
+      client->setTimeout(TELEGRAM_RESPONSE_TIMEOUT_MS);
+      client->setBufferSizes(4096, 512);
+
+      if (!client->connect(TELEGRAM_HOST, 443)) {
+         client->stop();
+         delete client;
+         return false;
+      }
+
+      tgClient = client;
+      tlsLog("novo cliente");
+      return true;
+   }
+
+   // Reads one byte, waiting at most until `deadline`. -1 on timeout/disconnect.
+   int readByte(uint32_t deadline) {
+      while (!tgExpired(deadline)) {
+         if (tgClient->available()) {
+            const int c = tgClient->read();
+
+            if (c >= 0) {
+               return c;
+            }
+         } else if (!tgClient->connected()) {
+            return -1;
+         }
+
+         yield();
+      }
+
+      return -1;
+   }
+
+   // Reads one CRLF terminated line (CRLF stripped). false on timeout/disconnect.
+   bool readLine(uint32_t deadline, String &line) {
+      line = "";
+
+      for (;;) {
+         const int c = readByte(deadline);
+
+         if (c < 0) {
+            return false;
+         }
+
+         if (c == '\n') {
+            return true;
+         }
+
+         if (c != '\r') {
+            if (line.length() >= 512) {
+               return false; // overlong/malformed header line
+            }
+
+            line += static_cast<char>(c);
+         }
+      }
+   }
+
+   // Appends exactly `length` body bytes to `out`.
+   bool readBodyInto(uint32_t deadline, size_t length, String &out) {
+      for (size_t i = 0; i < length; ++i) {
+         const int c = readByte(deadline);
+
+         if (c < 0) {
+            return false;
+         }
+
+         out += static_cast<char>(c);
+      }
+
+      return true;
+   }
+
+   // Reads exactly one HTTP/1.1 response (status line + headers + body) from the
+   // persistent client. Content-Length and Transfer-Encoding: chunked are
+   // honoured and the reader never consumes bytes belonging to the next response,
+   // so the connection stays reusable. false on any framing/transport error.
+   bool readHttpResponse(uint32_t deadline, String &body, int &status) {
+      String line;
+
+      if (!readLine(deadline, line) || line.indexOf("HTTP/") != 0) {
+         return false;
+      }
+
+      status = line.substring(line.indexOf(' ') + 1).toInt();
+
+      bool chunked = false;
+      long contentLength = -1;
+
+      for (;;) {
+         if (!readLine(deadline, line)) {
+            return false;
+         }
+
+         if (line.isEmpty()) {
+            break;
+         }
+
+         const int colon = line.indexOf(':');
+
+         if (colon <= 0) {
+            continue; // malformed header: ignore it
+         }
+
+         String name = line.substring(0, colon);
+         name.toLowerCase();
+
+         String value = line.substring(colon + 1);
+         value.trim();
+
+         if (name == "content-length") {
+            contentLength = value.toInt();
+         } else if (name == "transfer-encoding") {
+            value.toLowerCase();
+
+            if (value.indexOf("chunked") >= 0) {
+               chunked = true;
+            }
+         }
+      }
+
+      body = "";
+      body.reserve(1024);
+
+      if (chunked) {
+         for (;;) {
+            if (!readLine(deadline, line)) {
+               return false;
+            }
+
+            const int semi = line.indexOf(';');
+
+            if (semi >= 0) {
+               line = line.substring(0, semi); // drop the chunk extension
+            }
+
+            line.trim();
+
+            const long size = strtol(line.c_str(), nullptr, 16);
+
+            if (size < 0) {
+               return false;
+            }
+
+            if (size == 0) {
+               // Consume the trailers up to the closing empty line.
+               for (;;) {
+                  if (!readLine(deadline, line)) {
+                     return false;
+                  }
+
+                  if (line.isEmpty()) {
+                     break;
+                  }
+               }
+
+               break;
+            }
+
+            if (!readBodyInto(deadline, static_cast<size_t>(size), body)) {
+               return false;
+            }
+
+            // Each chunk's data is followed by its own CRLF.
+            if (!readLine(deadline, line) || !line.isEmpty()) {
+               return false;
+            }
+         }
+
+         return true;
+      }
+
+      if (contentLength < 0) {
+         return false; // no length and no chunking: cannot frame a keep-alive reply
+      }
+
+      return readBodyInto(deadline, static_cast<size_t>(contentLength), body);
    }
 
    // Diagnostic-only: what Telegram actually answered. Prints the parsed
@@ -130,6 +340,10 @@ bool Telegram::begin() {
    return true;
 }
 
+void Telegram::closeConnection() {
+   dropTgConnection();
+}
+
 String Telegram::urlEncode(const String &value) {
    String encoded;
    encoded.reserve(value.length() * 3);
@@ -166,75 +380,52 @@ bool Telegram::request(
    heapLog(method.c_str(), "pre-new");
 
    if (WiFi.status() != WL_CONNECTED) {
+      dropTgConnection();
       httpLog(method.c_str(), false, 0, httpStart);
       httpTransportLog(method.c_str(), "NO_WIFI", httpStart);
       return false;
    }
 
-   WiFiClientSecure client;
-   client.setInsecure();
-   client.setTimeout(TELEGRAM_RESPONSE_TIMEOUT_MS);
-
-   // BearSSL I/O buffers for this per-call Telegram TLS client. Default is
-   // setBufferSizes(16384, 512) -> 16709 B (in) + 597 B (out); the Telegram
-   // requests/responses are small, so 4096 payload bytes (-> 4421 + 597 B) fit
-   // alongside the ThingsBoard TLS client.
-   client.setBufferSizes(4096, 512);
-
-   heapLog(method.c_str(), "pre-connect");
-
-   if (!client.connect(TELEGRAM_HOST, 443)) {
+   if (!ensureConnection()) {
       heapLog(method.c_str(), "pos-connect-fail");
       httpLog(method.c_str(), false, 0, httpStart);
       httpTransportLog(method.c_str(), "CONNECT_FAIL", httpStart);
       return false;
    }
 
+   heapLog(method.c_str(), "pre-connect");
+
    const String path =
       "/bot" + String(TELEGRAM_BOT_TOKEN) +
       "/" + method +
       (query.isEmpty() ? "" : "?" + query);
 
-   client.print(
+   tgClient->print(
       String("GET ") + path + " HTTP/1.1\r\n"
       "Host: " + TELEGRAM_HOST + "\r\n"
-      "Connection: close\r\n\r\n"
+      "Connection: keep-alive\r\n\r\n"
    );
 
-   const uint32_t start = millis();
+   const uint32_t deadline = millis() + TELEGRAM_RESPONSE_TIMEOUT_MS;
 
-   while (!client.available() &&
-          static_cast<uint32_t>(millis() - start) < TELEGRAM_CONNECT_TIMEOUT_MS) {
-      yield();
-   }
+   int status = 0;
 
-   if (!client.available()) {
-      client.stop();
+   if (!readHttpResponse(deadline, response, status)) {
+      // The reply could not be framed, so the connection state is unknown: drop
+      // it and let the existing retry behaviour take over.
+      dropTgConnection();
       heapLog(method.c_str(), "pos-close-nodata");
       httpLog(method.c_str(), false, 0, httpStart);
       httpTransportLog(method.c_str(), "NO_DATA_TIMEOUT", httpStart);
       return false;
    }
 
-   response.reserve(1024);
-
-   while ((client.connected() || client.available()) &&
-          static_cast<uint32_t>(millis() - start) < TELEGRAM_RESPONSE_TIMEOUT_MS) {
-      while (client.available()) {
-         response += static_cast<char>(client.read());
-      }
-      yield();
-   }
-
-   client.stop();
-
-   heapLog(method.c_str(), "pos-close");
-
+   // `response` now holds the body only, so the previous JSON based verdict is
+   // unchanged; the connection stays open for the next operation.
    const bool ok = response.indexOf("{\"ok\"") >= 0;
-   const int http = diagHttpStatus(response);
 
-   httpLog(method.c_str(), ok, http, httpStart);
-   httpResponseLog(method.c_str(), response, http, httpStart);
+   httpLog(method.c_str(), ok, status, httpStart);
+   httpResponseLog(method.c_str(), response, status, httpStart);
 
    heapLog(method.c_str(), "pos-resposta");
 
