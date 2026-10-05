@@ -36,10 +36,6 @@ namespace {
    // Diagnostic-only: edge detector so the Wi-Fi connect instant is logged once.
    bool wifiConnectedLogged = false;
 
-   // Tracks the notification-sequence edge so the persistent Telegram TLS
-   // connection is released exactly once when a sequence finishes.
-   bool wasNotifying = false;
-
    void saveState() {
       stateStore.save(persisted);
    }
@@ -225,13 +221,6 @@ namespace {
       // insert a full HTTPS round-trip between every step. Commands are still
       // processed normally as soon as the sequence has finished (phase == NONE).
       const bool notifying = persisted.tgPending && persisted.tgPhase != TG_PHASE_NONE;
-
-      // The persistent Telegram TLS connection is released when the sequence
-      // ends; the next request reopens it on demand.
-      if (wasNotifying && !notifying) {
-         telegram.closeConnection();
-      }
-      wasNotifying = notifying;
 
       if (!notifying) {
          telegram.update(now);
