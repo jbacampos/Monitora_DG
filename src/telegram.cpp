@@ -60,6 +60,36 @@ namespace {
    // ---------------------------------------------------------------------------
    WiFiClientSecure *tgClient = nullptr;
 
+   // Instrumentation only: it measures
+   // the effect of spacing reused requests and never changes the HTTP/TLS logic.
+   uint32_t tgLastReqEndMs = 0; // millis() when the previous request really ended
+   bool tgReqReused = false;    // the request in flight uses a reused connection
+   bool tgReqAnyByte = false;   // at least one response byte was received
+   bool tgReqWriteOk = false;   // the request write completed normally
+
+   uint32_t tgReuseAttempts = 0;  // reuse branch taken in ensureConnection()
+   uint32_t tgReuseSuccess = 0;   // reused request whose response was framed
+   uint32_t tgReuseStalls = 0;    // reused + write ok + zero bytes + NO_DATA_TIMEOUT
+   uint32_t tgNewConnections = 0; // TLS connections actually established
+
+   // Phase timestamps of the response read in flight, all
+   // compared against tgT0 (the instant the request write returned). 0 means the
+   // phase was never reached.
+   uint32_t tgT0 = 0; // right after the request write returned
+   uint32_t tgT1 = 0; // first response byte
+   uint32_t tgT2 = 0; // status line complete
+   uint32_t tgT3 = 0; // headers complete
+   uint32_t tgT4 = 0; // body complete (success only)
+
+   // Prints a phase as "<n>ms" relative to t0, or "NONE".
+   void tgPhaseText(char *out, size_t len, uint32_t stamp, uint32_t t0) {
+      if (stamp == 0) {
+         snprintf(out, len, "NONE");
+      } else {
+         snprintf(out, len, "%lums", static_cast<unsigned long>(stamp - t0));
+      }
+   }
+
    // Diagnostic-only: connection lifecycle of the persistent TLS client.
    void tlsLog(const char *state) {
       Serial.printf("[%lu] TG TLS: %s\n", static_cast<unsigned long>(millis()), state);
@@ -84,6 +114,8 @@ namespace {
    bool ensureConnection() {
       if (tgClient != nullptr && tgClient->connected()) {
          tlsLog("conexao reutilizada");
+         tgReuseAttempts++;
+         tgReqReused = true;
          return true;
       }
 
@@ -99,6 +131,18 @@ namespace {
       client->setTimeout(TELEGRAM_RESPONSE_TIMEOUT_MS);
       client->setBufferSizes(4096, 512);
 
+      // WiFiClientSecureCtx::connect(host) does its own DNS lookup with a fixed
+      // 10 s timeout that ignores setTimeout(); resolving here first bounds that
+      // wait and leaves the answer in the lwIP DNS cache, so the framework lookup
+      // answers "address already known" (ERR_OK) without a second DNS.
+      IPAddress resolved;
+
+      if (!WiFi.hostByName(TELEGRAM_HOST, resolved, TELEGRAM_CONNECT_TIMEOUT_MS)) {
+         client->stop();
+         delete client;
+         return false;
+      }
+
       if (!client->connect(TELEGRAM_HOST, 443)) {
          client->stop();
          delete client;
@@ -106,6 +150,8 @@ namespace {
       }
 
       tgClient = client;
+      tgNewConnections++;
+      tgReqReused = false;
       tlsLog("novo cliente");
       return true;
    }
@@ -117,6 +163,11 @@ namespace {
             const int c = tgClient->read();
 
             if (c >= 0) {
+               if (!tgReqAnyByte) {
+                  tgReqAnyByte = true;
+                  tgT1 = millis(); // first response byte
+               }
+
                return c;
             }
          } else if (!tgClient->connected()) {
@@ -180,10 +231,17 @@ namespace {
          return false;
       }
 
+      tgT2 = millis(); // status line complete
+
       status = line.substring(line.indexOf(' ') + 1).toInt();
 
       bool chunked = false;
       long contentLength = -1;
+
+      // Diagnostic-only: keep-alive relevant headers exactly as the server sent
+      // them, so the connection policy can be read from the device itself.
+      String connectionHeader;
+      String transferEncodingHeader;
 
       for (;;) {
          if (!readLine(deadline, line)) {
@@ -208,7 +266,10 @@ namespace {
 
          if (name == "content-length") {
             contentLength = value.toInt();
+         } else if (name == "connection") {
+            connectionHeader = value;
          } else if (name == "transfer-encoding") {
+            transferEncodingHeader = value;
             value.toLowerCase();
 
             if (value.indexOf("chunked") >= 0) {
@@ -216,6 +277,14 @@ namespace {
             }
          }
       }
+
+      tgT3 = millis(); // headers complete
+
+      // Diagnostic-only: what the server declared about reusing the connection and
+      // about the body framing ("-" means the header was absent).
+      Serial.printf("[%lu] TG HDR: connection=\"%s\" content_length=%ld transfer_encoding=\"%s\"\n", static_cast<unsigned long>(millis()),
+                    connectionHeader.isEmpty() ? "-" : connectionHeader.c_str(), contentLength,
+                    transferEncodingHeader.isEmpty() ? "-" : transferEncodingHeader.c_str());
 
       body = "";
       body.reserve(1024);
@@ -344,6 +413,23 @@ void Telegram::closeConnection() {
    dropTgConnection();
 }
 
+// Diagnostic counters for the periodic DIAG line.
+uint32_t Telegram::reuseAttempts() const {
+   return tgReuseAttempts;
+}
+
+uint32_t Telegram::reuseSuccess() const {
+   return tgReuseSuccess;
+}
+
+uint32_t Telegram::reuseStalls() const {
+   return tgReuseStalls;
+}
+
+uint32_t Telegram::newConnections() const {
+   return tgNewConnections;
+}
+
 String Telegram::urlEncode(const String &value) {
    String encoded;
    encoded.reserve(value.length() * 3);
@@ -371,7 +457,8 @@ String Telegram::urlEncode(const String &value) {
 bool Telegram::request(
    const String &method,
    const String &query,
-   String &response) {
+   String &response,
+   bool allowReuse) {
 
    const uint32_t httpStart = millis();
 
@@ -379,10 +466,24 @@ bool Telegram::request(
 
    heapLog(method.c_str(), "pre-new");
 
+   // getUpdates() deliberately never reuses the persistent connection.
+   // Any connection left over from a previous operation is closed here, so the
+   // ensureConnection() below always opens a fresh TLS connection.
+   if (!allowReuse) {
+      Serial.printf("[%lu] TG TLS: %s sem reuse\n", static_cast<unsigned long>(millis()), method.c_str());
+
+      dropTgConnection();
+   }
+
+   // Per-request instrumentation state.
+   tgReqAnyByte = false;
+   tgReqWriteOk = false;
+
    if (WiFi.status() != WL_CONNECTED) {
       dropTgConnection();
       httpLog(method.c_str(), false, 0, httpStart);
       httpTransportLog(method.c_str(), "NO_WIFI", httpStart);
+      tgLastReqEndMs = millis();
       return false;
    }
 
@@ -390,34 +491,117 @@ bool Telegram::request(
       heapLog(method.c_str(), "pos-connect-fail");
       httpLog(method.c_str(), false, 0, httpStart);
       httpTransportLog(method.c_str(), "CONNECT_FAIL", httpStart);
+      tgLastReqEndMs = millis();
       return false;
    }
 
    heapLog(method.c_str(), "pre-connect");
+
+   // A REUSED connection is never used sooner than
+   // TELEGRAM_REUSE_MIN_GAP_MS after the previous request ended. Opening a new
+   // connection is not delayed. The wait is logged only when it really happens.
+   if (tgReqReused) {
+      const uint32_t sinceEnd = static_cast<uint32_t>(millis() - tgLastReqEndMs);
+
+      if (sinceEnd < TELEGRAM_REUSE_MIN_GAP_MS) {
+         const uint32_t waitMs = TELEGRAM_REUSE_MIN_GAP_MS - sinceEnd;
+
+         Serial.printf("[%lu] TG TLS: reuse aguardou %lums\n", static_cast<unsigned long>(millis()), static_cast<unsigned long>(waitMs));
+
+         delay(waitMs);
+      }
+   }
 
    const String path =
       "/bot" + String(TELEGRAM_BOT_TOKEN) +
       "/" + method +
       (query.isEmpty() ? "" : "?" + query);
 
-   tgClient->print(
+   const String header =
       String("GET ") + path + " HTTP/1.1\r\n"
       "Host: " + TELEGRAM_HOST + "\r\n"
-      "Connection: keep-alive\r\n\r\n"
-   );
+      "Connection: keep-alive\r\n\r\n";
+
+   const size_t written = tgClient->print(header);
+
+   // T0 = instant the request write returned. Every phase
+   // timestamp of this read is compared against it.
+   tgT0 = millis();
+   tgT1 = 0;
+   tgT2 = 0;
+   tgT3 = 0;
+   tgT4 = 0;
+
+   // The write counts as normal only when the whole request was
+   // accepted by the TLS layer (identical bytes, just measured).
+   tgReqWriteOk = (written == header.length());
+
+   // Diagnostic-only: what the TLS layer accepted and what the socket reports
+   // immediately after the request was written. Observing only.
+   Serial.printf("[%lu] TG DIAG: %s write_ret=%u avail=%d connected=%d\n", static_cast<unsigned long>(millis()), method.c_str(),
+                 static_cast<unsigned>(written), tgClient->available(), tgClient->connected() ? 1 : 0);
 
    const uint32_t deadline = millis() + TELEGRAM_RESPONSE_TIMEOUT_MS;
 
    int status = 0;
 
-   if (!readHttpResponse(deadline, response, status)) {
+   const bool framed = readHttpResponse(deadline, response, status);
+
+   const uint32_t tReadDone = millis();
+
+   if (framed) {
+      tgT4 = tReadDone; // body complete
+   }
+
+   // One line carrying every phase, relative to T0, printed
+   // for both outcomes, so a reply that arrives late is separated from a reply that
+   // never arrives. Nothing about the request flow changes.
+   char phFirst[16];
+   char phStatus[16];
+   char phHeaders[16];
+   char phBody[16];
+
+   tgPhaseText(phFirst, sizeof(phFirst), tgT1, tgT0);
+   tgPhaseText(phStatus, sizeof(phStatus), tgT2, tgT0);
+   tgPhaseText(phHeaders, sizeof(phHeaders), tgT3, tgT0);
+   tgPhaseText(phBody, sizeof(phBody), tgT4, tgT0);
+
+   // Diagnostic-only: the BearSSL error is read here, before any dropTgConnection()
+   // below destroys the engine that holds it.
+   char sslErr[160] = {0};
+   const int sslCode = tgClient->getLastSSLError(sslErr, sizeof(sslErr));
+
+   Serial.printf("[%lu] TG HTTP: %s write_ret=%u first_byte=%s status_line=%s headers=%s body=%s since_t0=%lums timeout=%lums duracao=%lums "
+                 "avail=%d connected=%d ssl_code=%d rssi=%d result=%s\n",
+                 static_cast<unsigned long>(millis()), method.c_str(), static_cast<unsigned>(written), phFirst, phStatus, phHeaders, phBody,
+                 static_cast<unsigned long>(tReadDone - tgT0), static_cast<unsigned long>(TELEGRAM_RESPONSE_TIMEOUT_MS),
+                 static_cast<unsigned long>(elapsedMs(httpStart)), tgClient->available(), tgClient->connected() ? 1 : 0, sslCode, WiFi.RSSI(),
+                 framed ? "OK" : (tgReqAnyByte ? "PARTIAL_TIMEOUT" : "NO_DATA_TIMEOUT"));
+
+   if (!framed) {
+      Serial.printf("[%lu] TG DIAG: %s read_fail ssl_code=%d ssl=%s\n", static_cast<unsigned long>(millis()), method.c_str(), sslCode, sslErr);
+
+      // stall = reused connection + normal write + zero response bytes
+      // + NO_DATA_TIMEOUT. Failures on a new connection, or failures that received
+      // at least one byte, are not counted.
+      if (tgReqReused && tgReqWriteOk && !tgReqAnyByte) {
+         tgReuseStalls++;
+      }
+
       // The reply could not be framed, so the connection state is unknown: drop
       // it and let the existing retry behaviour take over.
       dropTgConnection();
       heapLog(method.c_str(), "pos-close-nodata");
       httpLog(method.c_str(), false, 0, httpStart);
       httpTransportLog(method.c_str(), "NO_DATA_TIMEOUT", httpStart);
+      tgLastReqEndMs = millis();
       return false;
+   }
+
+   // A reused request that produced a framed HTTP response counts as a
+   // successful reuse, independently of the API level ok flag.
+   if (tgReqReused) {
+      tgReuseSuccess++;
    }
 
    // `response` now holds the body only, so the previous JSON based verdict is
@@ -428,6 +612,14 @@ bool Telegram::request(
    httpResponseLog(method.c_str(), response, status, httpStart);
 
    heapLog(method.c_str(), "pos-resposta");
+
+   tgLastReqEndMs = millis();
+
+   // A connection opened for getUpdates() is not left behind for the
+   // next request; every other method keeps the persistent connection.
+   if (!allowReuse) {
+      dropTgConnection();
+   }
 
    return ok;
 }
@@ -580,11 +772,14 @@ void Telegram::update(uint32_t now) {
       return;
    }
 
-   if (static_cast<uint32_t>(now - lastPoll_) < TELEGRAM_POLL_MS) {
+   // Polled at most once every TELEGRAM_GETUPDATES_INTERVAL_MS, counted from the END
+   // of the previous getUpdates(). millis() is read here instead of using the caller's
+   // `now`: that value is sampled at the top of the main loop and may already be
+   // seconds old, which would let the next poll start before the interval really
+   // elapsed. The unsigned subtraction is wrap-safe.
+   if (static_cast<uint32_t>(millis() - lastPoll_) < TELEGRAM_GETUPDATES_INTERVAL_MS) {
       return;
    }
-
-   lastPoll_ = now;
 
    String response;
 
@@ -601,10 +796,13 @@ void Telegram::update(uint32_t now) {
          "&limit=5&timeout=0";
    }
 
-   if (request("getUpdates", query, response)) {
+   if (request("getUpdates", query, response, false)) {
       processUpdates(response);
       firstPoll_ = false;
    }
+
+   // Stamped after the call returned, so the interval is measured end -> next start.
+   lastPoll_ = millis();
 }
 
 bool Telegram::commandRebootRequested() {

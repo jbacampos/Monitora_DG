@@ -19,6 +19,12 @@ public:
    bool commandRebootRequested();
    bool commandOtaRequested();
 
+   // Diagnostic counters, read by the periodic DIAG line.
+   uint32_t reuseAttempts() const;
+   uint32_t reuseSuccess() const;
+   uint32_t reuseStalls() const;
+   uint32_t newConnections() const;
+
 private:
    uint32_t lastPoll_ = 0;
    int32_t updateOffset_ = 0;
@@ -30,7 +36,8 @@ private:
    bool request(
       const String &method,
       const String &query,
-      String &response
+      String &response,
+      bool allowReuse = true
    );
 
    void processUpdates(const String &response);

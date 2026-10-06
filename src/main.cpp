@@ -36,6 +36,10 @@ namespace {
    // Diagnostic-only: edge detector so the Wi-Fi connect instant is logged once.
    bool wifiConnectedLogged = false;
 
+   // Monotonic start of the redeDisponivel failure grace window for THIS session.
+   // Re-armed after a reboot because millis() does not survive a reset.
+   uint32_t redeFailGraceMillis = 0;
+
    void saveState() {
       stateStore.save(persisted);
    }
@@ -51,9 +55,82 @@ namespace {
       }
    }
 
+   // Has the redeDisponivel failure grace window elapsed?
+   //
+   // Preferred reference: the wall clock. When the fall instant was captured as a
+   // real Epoch (NTP was available) and NTP is back, the elapsed time is measured
+   // from the ORIGINAL fall, so a reboot does not restart the window: a 15 s grace
+   // with the fall at 14:00:00 and a reboot at 14:00:05 still confirms at ~14:00:15.
+   //
+   // Conservative fallback: when there is no usable wall clock (never synced, a
+   // lost session, or a clock behind the fall) the elapsed time is measured from
+   // this session's re-armed monotonic timer. That can only confirm LATER than the
+   // true deadline, never earlier.
+   bool redeFailGraceElapsed() {
+      if (persisted.redeFailStarted.kind == TsKind::Epoch && timeSource.synced()) {
+         const uint32_t start = persisted.redeFailStarted.value;
+         const uint32_t nowEpoch = timeSource.now().value;
+
+         if (nowEpoch >= start) {
+            return static_cast<uint64_t>(nowEpoch - start) * 1000ULL >= REDE_FAIL_GRACE_MS;
+         }
+      }
+
+      return static_cast<uint32_t>(millis() - redeFailGraceMillis) >= REDE_FAIL_GRACE_MS;
+   }
+
+   // Confirms a pending FALTA once the grace window has elapsed. The history event
+   // and the Telegram notification keep the ORIGINAL fall instant.
+   void serviceRedeFailGrace() {
+      if (!persisted.redeFailGraceActive || persisted.power.redeDisponivel) {
+         return;
+      }
+
+      if (!redeFailGraceElapsed()) {
+         return;
+      }
+
+      persisted.redeFailGraceActive = false;
+
+      Serial.printf("[%lu] REDE: FALTA confirmada (graca vencida) ts kind=%d value=%lu\n", static_cast<unsigned long>(millis()),
+                    static_cast<int>(persisted.redeFailStarted.kind), static_cast<unsigned long>(persisted.redeFailStarted.value));
+
+      enqueue(persisted.power, persisted.redeFailStarted);
+      notifier.onRedeTransition(persisted.redeFailStarted);
+      saveState();
+   }
+
    void handleTransition(const PowerState &current, const Timestamp &ts) {
       const bool redeChanged = current.redeDisponivel != persisted.power.redeDisponivel;
       const bool previousRede = persisted.power.redeDisponivel;
+
+      // A redeDisponivel 1 -> 0 is not a FALTA yet: it opens a grace window. Until
+      // it elapses there is no ThingsBoard event and no Telegram notification.
+      if (redeChanged && !current.redeDisponivel) {
+         if (!persisted.redeFailGraceActive) {
+            persisted.redeFailGraceActive = true;
+            persisted.redeFailStarted = ts;
+            redeFailGraceMillis = millis();
+
+            Serial.printf("[%lu] REDE: queda detectada (graca %lums) ts kind=%d value=%lu\n", static_cast<unsigned long>(millis()),
+                          static_cast<unsigned long>(REDE_FAIL_GRACE_MS), static_cast<int>(ts.kind), static_cast<unsigned long>(ts.value));
+         }
+
+         persisted.power = current;
+         saveState();
+         return;
+      }
+
+      // The mains came back inside the grace window: the fall was transient.
+      if (redeChanged && current.redeDisponivel && persisted.redeFailGraceActive) {
+         persisted.redeFailGraceActive = false;
+
+         Serial.printf("[%lu] REDE: queda transitoria descartada (graca cancelada)\n", static_cast<unsigned long>(millis()));
+
+         persisted.power = current;
+         saveState();
+         return;
+      }
 
       enqueue(current, ts);
       persisted.power = current;
@@ -83,6 +160,7 @@ namespace {
          persisted.tgPending = false;
          persisted.tgForceNotify = false;
          persisted.tgPhase = TG_PHASE_NONE;
+         persisted.redeFailGraceActive = false;
          persisted.validReliable = true;
 
          enqueue(actual, timeSource.now());
@@ -93,29 +171,62 @@ namespace {
       const bool before = persisted.power.redeDisponivel;
       const bool after = actual.redeDisponivel;
 
+      // A grace window that was still pending when the device rebooted survives:
+      // it is never turned into a FALTA just because of the reboot.
+      if (persisted.redeFailGraceActive) {
+         persisted.power = actual;
+
+         if (after) {
+            // The mains came back while the device was off: the fall was transient.
+            persisted.redeFailGraceActive = false;
+            persisted.alive.timestamp = timeSource.now();
+            persisted.alive.redeDisponivel = true;
+
+            Serial.printf("[%lu] REDE: graca descartada apos reboot (rede voltou)\n", static_cast<unsigned long>(millis()));
+         } else {
+            // Still down: keep waiting for the remainder of the window.
+            redeFailGraceMillis = millis();
+
+            Serial.printf("[%lu] REDE: graca retomada apos reboot\n", static_cast<unsigned long>(millis()));
+         }
+
+         // Boot snapshot keeps its usual semantics; no FALTA is recorded here.
+         enqueue(actual, timeSource.now());
+         saveState();
+         return;
+      }
+
+      // A fall that is only observed after the reboot must pass the grace window
+      // too, so no FALTA is confirmed here.
+      if (before && !after) {
+         persisted.redeFailGraceActive = true;
+         persisted.redeFailStarted = persisted.alive.timestamp; // best estimate of the fall instant
+         redeFailGraceMillis = millis();
+         persisted.power = actual;
+
+         Serial.printf("[%lu] REDE: queda detectada no boot (graca %lums)\n", static_cast<unsigned long>(millis()),
+                       static_cast<unsigned long>(REDE_FAIL_GRACE_MS));
+
+         // Boot snapshot keeps its usual semantics; the FALTA stays deferred until
+         // the grace window elapses.
+         enqueue(actual, timeSource.now());
+         saveState();
+         return;
+      }
+
       Timestamp reconstructed{};
       bool hasReconstruction = false;
-      bool reconstructReturn = false;
 
-      if (before && !after) {
-         reconstructed = persisted.alive.timestamp; // CASE B
-         hasReconstruction = true;
-      } else if (!before && after) {
+      if (!before && after) {
          reconstructed = timeSource.now(); // CASE C
          hasReconstruction = true;
-         reconstructReturn = true;
       }
 
       persisted.power = actual;
 
       if (hasReconstruction) {
          enqueue(actual, reconstructed);
-
-         if (reconstructReturn) {
-            notifier.onBootReturnReconstruction(reconstructed);
-         } else {
-            notifier.onRedeTransition(reconstructed);
-         }
+         notifier.onBootReturnReconstruction(reconstructed);
       }
 
       if (actual.redeDisponivel) {
@@ -273,6 +384,11 @@ namespace {
 
       const uint32_t count = tbQueue.count();
 
+      // Counters printed next to the existing DIAG line.
+      Serial.printf("[%lu] TG DIAG: reuse_attempts=%lu reuse_success=%lu reuse_stalls=%lu new_connections=%lu\n", static_cast<unsigned long>(now),
+                    static_cast<unsigned long>(telegram.reuseAttempts()), static_cast<unsigned long>(telegram.reuseSuccess()),
+                    static_cast<unsigned long>(telegram.reuseStalls()), static_cast<unsigned long>(telegram.newConnections()));
+
       Serial.printf("DIAG up=%lus wifi=%d rssi=%d ntp=%d rede=%d pend=%lu head=%lu gap=%u tgPend=%d tgNotif=%d tgForce=%d tgPhase=%s fallId=%ld retId=%ld\n",
                     static_cast<unsigned long>(now / 1000UL), WiFi.status() == WL_CONNECTED ? 1 : 0, WiFi.RSSI(), timeSource.synced() ? 1 : 0,
                     persisted.power.redeDisponivel ? 1 : 0, static_cast<unsigned long>(count - persisted.tbLogHead),
@@ -325,6 +441,10 @@ void setup() {
 
       if (persisted.tgTimestamp.kind == TsKind::SessionMillis) {
          persisted.tgTimestamp.kind = TsKind::LostSession;
+      }
+
+      if (persisted.redeFailStarted.kind == TsKind::SessionMillis) {
+         persisted.redeFailStarted.kind = TsKind::LostSession;
       }
 
       Serial.println("Estado persistente carregado.");
@@ -396,6 +516,11 @@ void loop() {
          inputs.clearChanged();
       }
    }
+
+   // Confirms a rede failure whose grace window has elapsed. Pure state + millis()
+   // logic: the rest of the firmware keeps running during the window.
+   serviceRedeFailGrace();
+
    const uint32_t afterSample = millis();
 
    telemetry.update(now);

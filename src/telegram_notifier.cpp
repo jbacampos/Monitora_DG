@@ -117,7 +117,26 @@ void TelegramNotifier::onBootReturnReconstruction(const Timestamp &ts) {
 }
 
 void TelegramNotifier::update() {
-   if (state_ == nullptr || telegram_ == nullptr || !state_->tgPending) {
+   if (state_ == nullptr || telegram_ == nullptr) {
+      return;
+   }
+
+   // Reconciliation via the STATE is used for the RETURN direction only: Telegram can
+   // be left reporting "rede indisponivel" with no event to carry it, because a fall
+   // discarded inside the grace window is never reported as a transition (main.cpp
+   // handleTransition returns without notifying). That divergence must be acted on,
+   // otherwise the missing RETORNO would never be sent.
+   //
+   // The opposite direction is deliberately NOT derived from the state. A fall is
+   // announced only once the grace window confirms it (main.cpp
+   // serviceRedeFailGrace -> onRedeTransition): while the grace is still running
+   // persisted.power.redeDisponivel is already false, so acting on that divergence
+   // would start the FALTA — deleting the previous stickers — for a fall that may
+   // still be transient. A FALTA is therefore only ever started by the confirmation
+   // event.
+   const bool returnPending = (!state_->tgForceNotify && !state_->tgNotifiedRede && state_->power.redeDisponivel);
+
+   if (!state_->tgPending && !returnPending) {
       return;
    }
 
@@ -126,7 +145,13 @@ void TelegramNotifier::update() {
    }
 
    // Plain coalescing. A forced reboot reconstruction is never suppressed here.
-   if (!state_->tgForceNotify && state_->tgNotifiedRede == state_->power.redeDisponivel) {
+   //
+   // It is only valid when NO sequence is in flight: with an active phase Telegram
+   // does not yet reflect tgNotifiedRede (a sequence can be half sent, e.g. the
+   // FALTA sticker already posted), so the state must never be considered already
+   // delivered — otherwise the sequence would be abandoned mid-way and the phase
+   // would stay stuck forever.
+   if (state_->tgPhase == TG_PHASE_NONE && !state_->tgForceNotify && state_->tgNotifiedRede == state_->power.redeDisponivel) {
       state_->tgPending = false;
       save();
       return;

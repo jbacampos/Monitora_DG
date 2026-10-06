@@ -6,7 +6,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-constexpr char FIRMWARE_VERSION[] = "0.2.0";
+constexpr char FIRMWARE_VERSION[] = "1.0.0";
 constexpr char DEVICE_ID[] = "DG-01";
 
 // -----------------------------------------------------------------------------
@@ -35,7 +35,18 @@ constexpr uint32_t INPUT_SAMPLE_MS    = 100;
 constexpr uint32_t INPUT_DEBOUNCE_MS  = 150;
 constexpr uint32_t INPUT_STABILIZE_MS = 400;
 
+// Grace window for a redeDisponivel 1 -> 0 transition. A mains blink shorter
+// than this is treated as transient: no FALTA is generated (no ThingsBoard event
+// and no Telegram notification). The window delays the CONFIRMATION only: the
+// FALTA timestamp remains the original instant the fall was detected.
+constexpr uint32_t REDE_FAIL_GRACE_MS = 15000UL; // 15000UL;
+
 constexpr uint32_t TELEGRAM_POLL_MS  = 2000;
+
+// Administrative commands (/reboot, /ota, /who) do not need a fast response, so
+// getUpdates() is polled at most once every TELEGRAM_GETUPDATES_INTERVAL_MS. The
+// interval is counted from the END of the previous getUpdates() call.
+constexpr uint32_t TELEGRAM_GETUPDATES_INTERVAL_MS = 20000UL;
 constexpr uint32_t MQTT_RECONNECT_MS = 5000;
 constexpr uint32_t WIFI_RETRY_MS     = 10000;
 
@@ -45,7 +56,16 @@ constexpr uint32_t TB_HEARTBEAT_MS   = 60000;  // supervision heartbeat, ~60 s
 constexpr uint32_t DIAGNOSTIC_INTERVAL_MS = 60000;
 
 constexpr uint32_t TELEGRAM_CONNECT_TIMEOUT_MS  = 1500;
-constexpr uint32_t TELEGRAM_RESPONSE_TIMEOUT_MS = 1500;
+
+// Deadline for reading a whole HTTP reply. In the field, Telegram replies were
+// observed to arrive up to ~6 s after the request, so the read waits this long
+// before giving up. Kept at 6000 ms on purpose: do not go back to 1500 ms.
+constexpr uint32_t TELEGRAM_RESPONSE_TIMEOUT_MS = 6000UL;
+
+// Minimum spacing between the END of one Telegram HTTP request and the START of
+// the next one when the persistent TLS connection is being REUSED. Applied only
+// on reuse: a new connection is never delayed. 0 disables the spacing.
+constexpr uint32_t TELEGRAM_REUSE_MIN_GAP_MS = 700;
 
 // -----------------------------------------------------------------------------
 // Time source / NTP

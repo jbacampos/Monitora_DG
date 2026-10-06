@@ -55,6 +55,13 @@ struct PersistedState {
    uint8_t tgAdjectiveIndex = 0;
    uint8_t tgVerbIndex = 0;
 
+   // redeDisponivel failure grace window. While active, a 1 -> 0 fall has been
+   // observed but the FALTA is not confirmed yet. Persisted so a reboot does not
+   // lose the window. redeFailStarted keeps the ORIGINAL fall instant, which is
+   // the timestamp of the eventual FALTA event.
+   bool redeFailGraceActive = false;
+   Timestamp redeFailStarted{};
+
    uint32_t tbLogHead = 0;
    uint16_t tbGapCount = 0;
 };
