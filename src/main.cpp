@@ -338,22 +338,36 @@ namespace {
       }
 
       if (telegram.commandOtaRequested()) {
-         Serial.println("Comando /ota recebido. Reiniciando para atualizar.");
+         Serial.println("Comando /ota recebido. Verificando versao publicada.");
 
-         // The update itself is NOT run here: by now Telegram, ThingsBoard and the normal
-         // activity have fragmented the heap, and the OTA client needs a 16 709 byte
-         // CONTIGUOUS buffer. The request is persisted and the device restarts;
+         // The version published on GitHub decides whether an update is requested. Nothing is
+         // persisted when it cannot be verified (or when the firmware is already current), so
+         // a temporary network problem can never trigger an update. When it IS newer, the
+         // update itself is NOT run here: by now Telegram, ThingsBoard and the normal activity
+         // have fragmented the heap, and the OTA client needs a 16 709 byte CONTIGUOUS buffer.
          // runPendingOtaIfRequested() then updates on a clean boot, before any other TLS
          // client exists. The Telegram offset is persisted first so the same /ota update is
          // not delivered again after the reset.
-         telegram.sendText("Comando /ota recebido. Reiniciando para atualizar.");
+         String remoteVersion;
+         const Ota::VersionStatus version = ota.checkVersion(remoteVersion);
 
-         persisted.tgUpdateOffset = telegram.updateOffset();
-         persisted.otaRequested = true;
-         saveState();
+         if (version == Ota::VersionStatus::Unknown) {
+            Serial.println("OTA: versao remota indisponivel; atualizacao nao iniciada.");
+            telegram.sendText("Não foi possível verificar a versão disponível no GitHub. Atualização não iniciada.");
+         } else if (version == Ota::VersionStatus::UpToDate) {
+            Serial.printf("OTA: ja atualizado (instalada=%s remota=%s)\n", FIRMWARE_VERSION, remoteVersion.c_str());
+            telegram.sendText(String("Monitora_DG já está atualizado.\nVersão: ") + FIRMWARE_VERSION);
+         } else {
+            Serial.printf("OTA: nova versao disponivel %s (instalada %s)\n", remoteVersion.c_str(), FIRMWARE_VERSION);
+            telegram.sendText(String("Nova versão disponível: ") + remoteVersion + " (instalada: " + FIRMWARE_VERSION + "). Reiniciando para atualizar.");
 
-         delay(100);
-         ESP.restart();
+            persisted.tgUpdateOffset = telegram.updateOffset();
+            persisted.otaRequested = true;
+            saveState();
+
+            delay(100);
+            ESP.restart();
+         }
       }
 
       if (telegram.commandRebootRequested()) {

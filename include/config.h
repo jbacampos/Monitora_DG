@@ -7,7 +7,7 @@
 // -----------------------------------------------------------------------------
 
 // constexpr char FIRMWARE_VERSION[] = "0.9.0";
-constexpr char FIRMWARE_VERSION[] = "1.0.0";
+constexpr char FIRMWARE_VERSION[] = "1.1.0";
 constexpr char DEVICE_ID[] = "DG-01";
 
 // -----------------------------------------------------------------------------
@@ -55,6 +55,26 @@ constexpr uint32_t WIFI_RETRY_MS     = 10000;
 // needs Wi-Fi; if it does not come up within this window the update is skipped, the failure
 // is logged and the normal boot continues (the request is not retried automatically).
 constexpr uint32_t OTA_BOOT_WIFI_WAIT_MS = 30000;
+
+// -----------------------------------------------------------------------------
+// OTA version check (/ota)
+//
+// /ota asks GitHub for the latest release tag BEFORE creating an OTA request, so this
+// query runs during normal operation, with Telegram and ThingsBoard already connected.
+// The TLS client therefore mirrors their profile (4096/512): it is the same buffer
+// pair the Telegram poll allocates on every getUpdates() while ThingsBoard is up.
+// -----------------------------------------------------------------------------
+
+// Deadline for reading the GitHub reply.
+constexpr uint32_t OTA_VERSION_TIMEOUT_MS = 6000UL;
+
+// Bound for the DNS lookup of the API host. Same reason as TELEGRAM_CONNECT_TIMEOUT_MS:
+// WiFiClientSecure does its own lookup with a fixed 10 s timeout that ignores setTimeout().
+constexpr uint32_t OTA_VERSION_CONNECT_TIMEOUT_MS = 3000;
+
+// Sanity cap for the release JSON (the live reply is ~3.3 kB). A larger body is treated as
+// "could not verify" instead of being parsed.
+constexpr size_t OTA_VERSION_BODY_MAX = 16384;
 
 constexpr uint32_t ALIVE_INTERVAL_MS = 300000; // local alive, ~5 min
 constexpr uint32_t TB_HEARTBEAT_MS   = 60000;  // supervision heartbeat, ~60 s
