@@ -36,6 +36,35 @@ namespace {
    // Diagnostic-only: edge detector so the Wi-Fi connect instant is logged once.
    bool wifiConnectedLogged = false;
 
+   // ---------------------------------------------------------------------------
+   // Visual state notice: one Telegram line with the four LEDs.
+   //
+   // RAM only (never persisted). visualPending is armed by a change of any of the four
+   // signals and by the boot notice, and cleared only after the line was delivered (or
+   // when the settled state is already the last one reported). Change driven lines never
+   // represent a provisional redeDisponivel fall and only go out after the state has been
+   // stable for VISUAL_NOTICE_GRACE_MS: see serviceVisualNotice().
+   // ---------------------------------------------------------------------------
+
+   // Stability window for the visual line. Every change that arms visualPending restarts
+   // it, so a fast sequence (offgrid ON -> both OFF -> gerador ON) coalesces into a single
+   // line carrying the final state: no intermediate situation is ever sent. The boot line
+   // is exempt and goes out immediately after the boot text.
+   constexpr uint32_t VISUAL_NOTICE_GRACE_MS = 3000UL;
+
+   bool visualPending = false;
+   bool visualBootPending = false; // boot line: immediate, ignores the stability window
+   uint32_t visualArmedMillis = 0;
+   bool bootTextSent = false;
+   bool visualStateKnown = false;
+   PowerState lastVisualState{};
+
+   constexpr char LED_REDE_ON[] = "\xF0\x9F\x9F\xA2";      // 🟢 rede disponivel
+   constexpr char LED_ALIM_REDE_ON[] = "\xF0\x9F\x94\xB5"; // 🔵 alimentacao pela rede
+   constexpr char LED_OFFGRID_ON[] = "\xF0\x9F\x9F\xA1";   // 🟡 alimentacao pelo offgrid
+   constexpr char LED_GERADOR_ON[] = "\xF0\x9F\x94\xB4";   // 🔴 alimentacao pelo gerador
+   constexpr char LED_OFF[] = "\xE2\x9A\xAA";              // ⚪ estado OFF/inativo
+
    // Monotonic start of the redeDisponivel failure grace window for THIS session.
    // Re-armed after a reboot because millis() does not survive a reset.
    uint32_t redeFailGraceMillis = 0;
@@ -384,15 +413,75 @@ namespace {
       }
    }
 
+   // One line with the four LEDs, in the fixed order: rede disponivel, alimentacao pela
+   // rede, offgrid, gerador. A dim signal is the white circle, a single ASCII space between
+   // them, no text, no labels, no line break.
+   String visualLine(const PowerState &s) {
+      char line[24]; // 4 LEDs (3-4 bytes each) + 3 spaces + NUL
+
+      snprintf(line, sizeof(line), "%s %s %s %s", s.redeDisponivel ? LED_REDE_ON : LED_OFF, s.alimentacaoRede ? LED_ALIM_REDE_ON : LED_OFF,
+               s.alimentacaoOffgrid ? LED_OFFGRID_ON : LED_OFF, s.alimentacaoGerador ? LED_GERADOR_ON : LED_OFF);
+
+      return String(line);
+   }
+
+   // Sends the visual line once per boot (right after the boot text) and whenever a change
+   // of the four signals has been settled. A provisional redeDisponivel fall - one that is
+   // still inside the grace window - is never represented by a change driven line: it waits
+   // until the window is resolved (FALTA confirmed or fall discarded). A discarded fall
+   // leaves the state equal to the last one reported, which suppresses the message entirely.
+   // While a FALTA/RETORNO sequence is in flight (tgPhase != NONE) the line waits, so the
+   // existing coalescing is respected and nothing interleaves with the stickers/texts.
+   void serviceVisualNotice() {
+      if (!visualPending || !bootTextSent || WiFi.status() != WL_CONNECTED) {
+         return;
+      }
+
+      if (persisted.tgPhase != TG_PHASE_NONE) {
+         return;
+      }
+
+      // The boot line mirrors the GPIOs even while a grace window is pending; a change
+      // driven line never does.
+      if (persisted.redeFailGraceActive && visualStateKnown) {
+         return;
+      }
+
+      // Stability window. The boot line is exempt, so it follows the boot text right away.
+      if (!visualBootPending && static_cast<uint32_t>(millis() - visualArmedMillis) < VISUAL_NOTICE_GRACE_MS) {
+         return;
+      }
+
+      const PowerState current = inputs.state();
+
+      if (visualStateKnown && samePowerState(current, lastVisualState)) {
+         visualPending = false; // the fall was transient: same state as the last one reported
+         return;
+      }
+
+      // Consumed before the send: a change during the send re-arms the flag.
+      visualPending = false;
+
+      if (telegram.sendText(visualLine(current))) {
+         lastVisualState = current;
+         visualStateKnown = true;
+         visualBootPending = false;
+
+         Serial.printf("[%lu] TG: LEDs enviados rede=%d alim_rede=%d offgrid=%d gerador=%d\n", static_cast<unsigned long>(millis()),
+                       current.redeDisponivel ? 1 : 0, current.alimentacaoRede ? 1 : 0, current.alimentacaoOffgrid ? 1 : 0,
+                       current.alimentacaoGerador ? 1 : 0);
+      } else {
+         visualPending = true; // retry with the state detected then
+      }
+   }
+
    // One Telegram message per boot, using the normal sendMessage() infrastructure.
-   // The "sent" flag lives in RAM only, so every reset re-arms it; the loop is the retry
-   // mechanism and nothing here blocks the boot (setup() never waits for Telegram).
+   // The bootTextSent flag lives in RAM only, so every reset re-arms it; the loop is the
+   // retry mechanism and nothing here blocks the boot (setup() never waits for Telegram).
    // An OTA reboot is reported by the ESP8266 as a generic software restart, so it is
    // identified by the marker persisted before the update started (pendingBootReason).
    void serviceBootNotice() {
-      static bool sent = false;
-
-      if (sent || WiFi.status() != WL_CONNECTED) {
+      if (bootTextSent || WiFi.status() != WL_CONNECTED) {
          return;
       }
 
@@ -401,7 +490,11 @@ namespace {
       const String message = String("Monitora_DG reiniciado.\nVersão: ") + FIRMWARE_VERSION + "\nMotivo: " + reason;
 
       if (telegram.sendText(message)) {
-         sent = true;
+         bootTextSent = true;
+         // The visual line follows the boot text (serviceVisualNotice(), same loop pass) and
+         // is exempt from the stability window.
+         visualPending = true;
+         visualBootPending = true;
 
          // Consume the marker only after the message was actually delivered, then persist
          // the cleared state so the next boot reports the real reset reason again.
@@ -621,6 +714,8 @@ void loop() {
 
          if (!samePowerState(current, persisted.power)) {
             handleTransition(current, timeSource.now());
+            visualArmedMillis = millis(); // every change restarts the stability window
+            visualPending = true;         // the settled state is reported by serviceVisualNotice()
             printState("Transicao:", current);
          }
 
@@ -646,6 +741,9 @@ void loop() {
 
    // Boot notice: exactly one per boot, sent as soon as Telegram is reachable.
    serviceBootNotice();
+
+   // Visual state line: after the boot text and after any accepted change of the signals.
+   serviceVisualNotice();
 
    const uint32_t afterTg = millis();
 
