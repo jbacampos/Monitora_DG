@@ -8,6 +8,11 @@ public:
    bool begin();
    void update(uint32_t now);
 
+   // Releases the ThingsBoard TLS socket and its BearSSL buffers/context, so the heap has
+   // a contiguous block large enough for the OTA client's default 16.7 kB RX buffer.
+   // The next update() reconnects normally.
+   void closeConnection();
+
    bool connected() const { return connected_; }
 
    // Publishes one historical event (telemetry, with its original timestamp).

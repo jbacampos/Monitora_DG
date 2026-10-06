@@ -6,6 +6,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
+// constexpr char FIRMWARE_VERSION[] = "0.9.0";
 constexpr char FIRMWARE_VERSION[] = "1.0.0";
 constexpr char DEVICE_ID[] = "DG-01";
 
@@ -49,6 +50,11 @@ constexpr uint32_t TELEGRAM_POLL_MS  = 2000;
 constexpr uint32_t TELEGRAM_GETUPDATES_INTERVAL_MS = 20000UL;
 constexpr uint32_t MQTT_RECONNECT_MS = 5000;
 constexpr uint32_t WIFI_RETRY_MS     = 10000;
+
+// Bounded wait for the network on the boot that runs a pending /ota update. The OTA client
+// needs Wi-Fi; if it does not come up within this window the update is skipped, the failure
+// is logged and the normal boot continues (the request is not retried automatically).
+constexpr uint32_t OTA_BOOT_WIFI_WAIT_MS = 30000;
 
 constexpr uint32_t ALIVE_INTERVAL_MS = 300000; // local alive, ~5 min
 constexpr uint32_t TB_HEARTBEAT_MS   = 60000;  // supervision heartbeat, ~60 s

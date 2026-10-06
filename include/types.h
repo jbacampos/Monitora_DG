@@ -37,6 +37,14 @@ enum TgPhase : uint8_t {
    TG_PHASE_TEXT_RET
 };
 
+// Boot reason marker. The ESP8266 reports an OTA-triggered reboot as a generic software
+// restart, so an update in progress is marked here before ESPhttpUpdate starts; the next
+// boot then reports "Update/OTA" and clears the marker.
+enum BootReason : uint8_t {
+   BOOT_REASON_NONE = 0,
+   BOOT_REASON_OTA
+};
+
 struct PersistedState {
    bool validReliable = false;
    PowerState power{};
@@ -64,6 +72,20 @@ struct PersistedState {
 
    uint32_t tbLogHead = 0;
    uint16_t tbGapCount = 0;
+
+   // Last Telegram update_id + 1 that was already processed. Persisted only when a
+   // received command can reboot the device before the next getUpdates(), so the same
+   // /reboot or /ota is not delivered and executed again after the reset.
+   int32_t tgUpdateOffset = 0;
+
+   // Marks the next boot as caused by an OTA update instead of a generic reset.
+   BootReason pendingBootReason = BOOT_REASON_NONE;
+
+   // Set by /ota together with the restart request: the update itself runs after the next
+   // boot, before Telegram and ThingsBoard exist (cleanest heap). It is consumed before the
+   // attempt, so a failed download, a power cut or a watchdog reset cannot retry it
+   // automatically on the following boot.
+   bool otaRequested = false;
 };
 
 // A ThingsBoard history record: a snapshot associated with a detected change.

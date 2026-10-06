@@ -4,7 +4,9 @@
 
 class Telegram {
 public:
-   bool begin();
+   // restoredUpdateOffset is the persisted update_id + 1 (0 when nothing is known yet).
+   // It is restored so an update already processed before a reboot is not executed again.
+   bool begin(int32_t restoredUpdateOffset = 0);
 
    void update(uint32_t now);
 
@@ -18,6 +20,10 @@ public:
 
    bool commandRebootRequested();
    bool commandOtaRequested();
+
+   // update_id + 1 of the last processed batch. The caller persists it when a received
+   // command is about to reboot the device, before doing so.
+   int32_t updateOffset() const;
 
    // Diagnostic counters, read by the periodic DIAG line.
    uint32_t reuseAttempts() const;

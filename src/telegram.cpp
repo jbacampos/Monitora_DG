@@ -400,10 +400,13 @@ namespace {
    }
 } // namespace
 
-bool Telegram::begin() {
+bool Telegram::begin(int32_t restoredUpdateOffset) {
    lastPoll_ = 0;
-   updateOffset_ = 0;
-   firstPoll_ = true;
+   updateOffset_ = restoredUpdateOffset;
+   // With a restored offset there is no stale backlog to skip: the first poll must ask
+   // for offset = updateOffset_. Otherwise Telegram returns the last update (the very
+   // /reboot that restarted the device) and the command would loop forever.
+   firstPoll_ = (updateOffset_ == 0);
    rebootRequested_ = false;
    otaRequested_ = false;
    return true;
@@ -627,9 +630,10 @@ bool Telegram::request(
 bool Telegram::sendText(const String &message) {
    String response;
 
-   const String query =
+    const String query =
       "chat_id=" + urlEncode(TELEGRAM_CHAT_ID) +
-      "&text=" + urlEncode(message);
+      "&text=" + urlEncode(message) +
+      "&parse_mode=HTML";
 
    if (!request("sendMessage", query, response)) {
       return false;
@@ -749,9 +753,13 @@ void Telegram::processUpdates(const String &response) {
       updateOffset_ = update["update_id"].as<int32_t>() + 1;
 
       const char *text = update["message"]["text"] | "";
-      const char *chatId = update["message"]["chat"]["id"] | "";
 
-      if (String(chatId) != String(TELEGRAM_CHAT_ID)) {
+      // chat.id arrives as a JSON number (ours does not fit in 32 bits), so it must be
+      // compared numerically: read as a string the number yields the default "" and
+      // every message would be dropped by the check below.
+      const long long chatId = update["message"]["chat"]["id"] | 0LL;
+
+      if (chatId != strtoll(TELEGRAM_CHAT_ID, nullptr, 10)) {
          continue;
       }
 
@@ -815,4 +823,8 @@ bool Telegram::commandOtaRequested() {
    const bool result = otaRequested_;
    otaRequested_ = false;
    return result;
+}
+
+int32_t Telegram::updateOffset() const {
+   return updateOffset_;
 }

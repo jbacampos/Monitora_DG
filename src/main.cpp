@@ -338,18 +338,110 @@ namespace {
       }
 
       if (telegram.commandOtaRequested()) {
-         Serial.println("Comando /ota recebido.");
-         telegram.sendText("Comando /ota recebido. Executando atualizacao.");
-         telegram.closeConnection(); // OTA opens its own, larger TLS client
-         ota.run();
+         Serial.println("Comando /ota recebido. Reiniciando para atualizar.");
+
+         // The update itself is NOT run here: by now Telegram, ThingsBoard and the normal
+         // activity have fragmented the heap, and the OTA client needs a 16 709 byte
+         // CONTIGUOUS buffer. The request is persisted and the device restarts;
+         // runPendingOtaIfRequested() then updates on a clean boot, before any other TLS
+         // client exists. The Telegram offset is persisted first so the same /ota update is
+         // not delivered again after the reset.
+         telegram.sendText("Comando /ota recebido. Reiniciando para atualizar.");
+
+         persisted.tgUpdateOffset = telegram.updateOffset();
+         persisted.otaRequested = true;
+         saveState();
+
+         delay(100);
+         ESP.restart();
       }
 
       if (telegram.commandRebootRequested()) {
          Serial.println("Comando /reboot recebido.");
+
+         // Persist the Telegram offset BEFORE the reboot, otherwise the same update is
+         // delivered again on the next boot and the command loops forever.
+         persisted.tgUpdateOffset = telegram.updateOffset();
+         saveState();
+
          telegram.sendText("Comando /reboot recebido. Reiniciando.");
          delay(100);
          ESP.restart();
       }
+   }
+
+   // One Telegram message per boot, using the normal sendMessage() infrastructure.
+   // The "sent" flag lives in RAM only, so every reset re-arms it; the loop is the retry
+   // mechanism and nothing here blocks the boot (setup() never waits for Telegram).
+   // An OTA reboot is reported by the ESP8266 as a generic software restart, so it is
+   // identified by the marker persisted before the update started (pendingBootReason).
+   void serviceBootNotice() {
+      static bool sent = false;
+
+      if (sent || WiFi.status() != WL_CONNECTED) {
+         return;
+      }
+
+      const bool fromUpdate = (persisted.pendingBootReason == BOOT_REASON_OTA);
+      const String reason = fromUpdate ? String("Update/OTA") : ESP.getResetReason();
+      const String message = String("Monitora_DG reiniciado.\nVersão: ") + FIRMWARE_VERSION + "\nMotivo: " + reason;
+
+      if (telegram.sendText(message)) {
+         sent = true;
+
+         // Consume the marker only after the message was actually delivered, then persist
+         // the cleared state so the next boot reports the real reset reason again.
+         if (fromUpdate) {
+            persisted.pendingBootReason = BOOT_REASON_NONE;
+            saveState();
+         }
+
+         Serial.printf("[%lu] TG: notificacao de boot enviada (motivo=%s)\n", static_cast<unsigned long>(millis()),
+                       fromUpdate ? "Update/OTA" : "reset");
+      }
+   }
+
+   // Runs a pending /ota update on a clean boot. Called from setup() right after wifi.begin()
+   // and BEFORE telegram.begin()/telemetry.begin(), so the OTA client is the first TLS client
+   // of the boot and gets the least fragmented heap. Ota::run() is used exactly as it is.
+   void runPendingOtaIfRequested() {
+      if (!persisted.otaRequested) {
+         return;
+      }
+
+      const uint32_t waitStart = millis();
+
+      while (!wifi.connected() && (millis() - waitStart) < OTA_BOOT_WIFI_WAIT_MS) {
+         wifi.update(millis());
+         delay(50);
+      }
+
+      // Consume the request BEFORE attempting the update: a failed download, a power cut or
+      // a watchdog reset then cannot trigger another automatic attempt on the next boot.
+      persisted.otaRequested = false;
+      // If the update completes, ESPhttpUpdate reboots the device and the next boot reports
+      // this as the reset reason.
+      persisted.pendingBootReason = BOOT_REASON_OTA;
+      saveState();
+
+      if (!wifi.connected()) {
+         persisted.pendingBootReason = BOOT_REASON_NONE;
+         saveState();
+         Serial.printf("[%lu] OTA: sem Wi-Fi em %lums - atualizacao nao iniciada\n", static_cast<unsigned long>(millis()),
+                       static_cast<unsigned long>(OTA_BOOT_WIFI_WAIT_MS));
+         return;
+      }
+
+      Serial.printf("[%lu] OTA: solicitacao pendente, executando no boot limpo\n", static_cast<unsigned long>(millis()));
+
+      ota.run();
+
+      // Only reached when the update did NOT reboot the device, i.e. it failed: report it
+      // and let the normal boot continue, with no marker that could claim a successful OTA.
+      persisted.pendingBootReason = BOOT_REASON_NONE;
+      saveState();
+
+      Serial.printf("[%lu] OTA: tentativa falhou - seguindo o boot normal\n", static_cast<unsigned long>(millis()));
    }
 
    const char *phaseName(uint8_t phase) {
@@ -458,7 +550,12 @@ void setup() {
 
    heapDiag("setup:pos-wifi-begin");
 
-   telegram.begin();
+   // A pending /ota runs here: after wifi.begin() but before telegram.begin() and
+   // telemetry.begin(), so no other TLS client exists yet and the heap is at its cleanest.
+   // On failure the normal boot simply continues from telegram.begin() below.
+   runPendingOtaIfRequested();
+
+   telegram.begin(persisted.tgUpdateOffset);
 
    heapDiag("setup:pos-telegram-begin");
 
@@ -532,6 +629,10 @@ void loop() {
 
    notifier.update();
    handleTelegramCommands(now);
+
+   // Boot notice: exactly one per boot, sent as soon as Telegram is reachable.
+   serviceBootNotice();
+
    const uint32_t afterTg = millis();
 
    updateAlive(now);

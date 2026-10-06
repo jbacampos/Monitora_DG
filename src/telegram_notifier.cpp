@@ -363,7 +363,7 @@ String TelegramNotifier::buildMessage(bool returnOfEnergy) const {
    const char *adjective = ADJECTIVES[state_->tgAdjectiveIndex % kAdjectiveCount];
    const char *person = returnOfEnergy ? "Huno" : "Oliver";
    const char *verb = returnOfEnergy ? RETURN_VERBS[state_->tgVerbIndex % kReturnVerbCount] : FAILURE_VERBS[state_->tgVerbIndex % kFailureVerbCount];
-   const char *text = returnOfEnergy ? "A LUZ VOLTOU!" : "FALTOU LUZ!";
+   const char *text = returnOfEnergy ? "<b>A LUZ VOLTOU!</b>" : "<b>FALTOU LUZ!</b>";
    const char *emoji = returnOfEnergy ? EMOJI_RETURN : EMOJI_FALL;
 
    char when[40];

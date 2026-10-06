@@ -34,6 +34,7 @@ bool Telemetry::begin() {
    return true;
 }
 
+
 bool Telemetry::connectMqtt() {
    if (WiFi.status() != WL_CONNECTED) {
       return false;
