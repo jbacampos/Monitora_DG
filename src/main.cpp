@@ -39,9 +39,11 @@ namespace {
    // ---------------------------------------------------------------------------
    // Visual state notice: one Telegram line with the four LEDs.
    //
-   // RAM only (never persisted). visualPending is armed by a change of any of the four
-   // signals and by the boot notice, and cleared only after the line was delivered (or
-   // when the settled state is already the last one reported). Change driven lines never
+   // The flags below are RAM only (never persisted), but the id of the current visual
+   // message IS persisted (PersistedState::lastVisualMessageId / visualDeletePendingId) so a
+   // new boot line can replace the previous one. visualPending is armed by a change of any of
+   // the four signals and by the boot notice, and cleared only after the line was delivered
+   // (or when the settled state is already the last one reported). Change driven lines never
    // represent a provisional redeDisponivel fall and only go out after the state has been
    // stable for VISUAL_NOTICE_GRACE_MS: see serviceVisualNotice().
    // ---------------------------------------------------------------------------
@@ -432,12 +434,36 @@ namespace {
    // leaves the state equal to the last one reported, which suppresses the message entirely.
    // While a FALTA/RETORNO sequence is in flight (tgPhase != NONE) the line waits, so the
    // existing coalescing is respected and nothing interleaves with the stickers/texts.
+   //
+   // Exactly one visual message is kept: the previous one is deleted only AFTER the new
+   // one was confirmed (its id is persisted first). If that deletion fails, its id stays
+   // persisted (visualDeletePendingId) and no new line is sent until it succeeds, so
+   // orphan bubbles never accumulate. Changes arriving meanwhile keep arming visualPending
+   // and are coalesced into the current state.
    void serviceVisualNotice() {
-      if (!visualPending || !bootTextSent || WiFi.status() != WL_CONNECTED) {
+      if (!bootTextSent || WiFi.status() != WL_CONNECTED) {
          return;
       }
 
       if (persisted.tgPhase != TG_PHASE_NONE) {
+         return;
+      }
+
+      // A previous visual message awaiting its deletion blocks any new visual message:
+      // the pending deletion is retried first. The current state stays pending
+      // (visualPending) and coalesced, and is sent once the deletion is resolved.
+      if (persisted.visualDeletePendingId != 0) {
+         if (telegram.deleteMessage(persisted.visualDeletePendingId)) {
+            persisted.visualDeletePendingId = 0;
+            saveState();
+
+            Serial.printf("[%lu] TG: LEDs antigos apagados (pendente)\n", static_cast<unsigned long>(millis()));
+         } else {
+            return; // keep the id persisted and retry before sending a new line
+         }
+      }
+
+      if (!visualPending) {
          return;
       }
 
@@ -462,14 +488,38 @@ namespace {
       // Consumed before the send: a change during the send re-arms the flag.
       visualPending = false;
 
-      if (telegram.sendText(visualLine(current))) {
+      int32_t messageId = 0;
+
+      if (telegram.sendText(visualLine(current), messageId) && messageId > 0) {
+         const int32_t previousId = persisted.lastVisualMessageId;
+
+         // Persist the new id and the previous one BEFORE deleting: a failure between the
+         // two steps can never lose the current visual state.
+         persisted.lastVisualMessageId = messageId;
+         persisted.visualDeletePendingId = (previousId > 0 && previousId != messageId) ? previousId : 0;
+         saveState();
+
          lastVisualState = current;
          visualStateKnown = true;
          visualBootPending = false;
 
-         Serial.printf("[%lu] TG: LEDs enviados rede=%d alim_rede=%d offgrid=%d gerador=%d\n", static_cast<unsigned long>(millis()),
+         Serial.printf("[%lu] TG: LEDs enviados rede=%d alim_rede=%d offgrid=%d gerador=%d id=%ld\n", static_cast<unsigned long>(millis()),
                        current.redeDisponivel ? 1 : 0, current.alimentacaoRede ? 1 : 0, current.alimentacaoOffgrid ? 1 : 0,
-                       current.alimentacaoGerador ? 1 : 0);
+                       current.alimentacaoGerador ? 1 : 0, static_cast<long>(messageId));
+
+         // Replace the previous visual message. If the deletion fails, the id stays
+         // persisted and the next pass retries it (blocking any new line until then).
+         if (persisted.visualDeletePendingId != 0) {
+            if (telegram.deleteMessage(persisted.visualDeletePendingId)) {
+               persisted.visualDeletePendingId = 0;
+               saveState();
+
+               Serial.printf("[%lu] TG: LEDs antigos apagados\n", static_cast<unsigned long>(millis()));
+            } else {
+               Serial.printf("[%lu] TG: LEDs antigos: apagar falhou id=%ld\n", static_cast<unsigned long>(millis()),
+                             static_cast<long>(persisted.visualDeletePendingId));
+            }
+         }
       } else {
          visualPending = true; // retry with the state detected then
       }
@@ -588,12 +638,13 @@ namespace {
                     static_cast<unsigned long>(telegram.reuseAttempts()), static_cast<unsigned long>(telegram.reuseSuccess()),
                     static_cast<unsigned long>(telegram.reuseStalls()), static_cast<unsigned long>(telegram.newConnections()));
 
-      Serial.printf("DIAG up=%lus wifi=%d rssi=%d ntp=%d rede=%d pend=%lu head=%lu gap=%u tgPend=%d tgNotif=%d tgForce=%d tgPhase=%s fallId=%ld retId=%ld\n",
+      Serial.printf("DIAG up=%lus wifi=%d rssi=%d ntp=%d rede=%d pend=%lu head=%lu gap=%u tgPend=%d tgNotif=%d tgForce=%d tgPhase=%s fallId=%ld retId=%ld visId=%ld visDelId=%ld\n",
                     static_cast<unsigned long>(now / 1000UL), WiFi.status() == WL_CONNECTED ? 1 : 0, WiFi.RSSI(), timeSource.synced() ? 1 : 0,
                     persisted.power.redeDisponivel ? 1 : 0, static_cast<unsigned long>(count - persisted.tbLogHead),
                     static_cast<unsigned long>(persisted.tbLogHead), persisted.tbGapCount, persisted.tgPending ? 1 : 0, persisted.tgNotifiedRede ? 1 : 0,
                     persisted.tgForceNotify ? 1 : 0, phaseName(persisted.tgPhase), static_cast<long>(persisted.lastFallStickerId),
-                    static_cast<long>(persisted.lastReturnStickerId));
+                    static_cast<long>(persisted.lastReturnStickerId), static_cast<long>(persisted.lastVisualMessageId),
+                    static_cast<long>(persisted.visualDeletePendingId));
    }
 } // namespace
 

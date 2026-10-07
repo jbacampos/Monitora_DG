@@ -15,6 +15,10 @@ public:
    void closeConnection();
 
    bool sendText(const String &message);
+   // sendMessage() variant that also reports the created message_id, so the caller can
+   // replace (delete) the previous visual message. Returns the API ok flag; messageId is
+   // set to 0 when the reply carried no id.
+   bool sendText(const String &message, int32_t &messageId);
    bool sendSticker(const String &stickerId, int32_t &messageId);
    bool deleteMessage(int32_t messageId);
 
@@ -45,6 +49,10 @@ private:
       String &response,
       bool allowReuse = true
    );
+
+   // Shared sendMessage() implementation. When outId is non-null it receives the
+   // message_id from the Telegram reply (0 when the reply carried no id).
+   bool sendMessageInternal(const String &message, int32_t *outId);
 
    void processUpdates(const String &response);
 

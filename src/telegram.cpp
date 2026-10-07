@@ -628,9 +628,21 @@ bool Telegram::request(
 }
 
 bool Telegram::sendText(const String &message) {
+   return sendMessageInternal(message, nullptr);
+}
+
+bool Telegram::sendText(const String &message, int32_t &messageId) {
+   return sendMessageInternal(message, &messageId);
+}
+
+bool Telegram::sendMessageInternal(const String &message, int32_t *outId) {
+   if (outId != nullptr) {
+      *outId = 0;
+   }
+
    String response;
 
-    const String query =
+   const String query =
       "chat_id=" + urlEncode(TELEGRAM_CHAT_ID) +
       "&text=" + urlEncode(message) +
       "&parse_mode=HTML";
@@ -645,7 +657,18 @@ bool Telegram::sendText(const String &message) {
       return false;
    }
 
-   return doc["ok"] | false;
+   if (!(doc["ok"] | false)) {
+      return false;
+   }
+
+   if (outId != nullptr) {
+      *outId = doc["result"]["message_id"] | 0;
+
+      // Diagnostic-only: confirm the exact API field that feeds lastVisualMessageId.
+      Serial.printf("[%lu] TG: sendMessage result.message_id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(*outId));
+   }
+
+   return true;
 }
 
 bool Telegram::sendSticker(const String &stickerId, int32_t &messageId) {

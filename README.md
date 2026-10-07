@@ -99,6 +99,12 @@ um snapshot obrigatorio dos quatro estados para o ThingsBoard.
 - Fases persistidas (DEL_OLD/SEND_FALL/TEXT_FALL/SEND_RET/TEXT_RET) permitem retomar apos
   reboot. Os indices de adjetivo/verbo sao escolhidos uma vez por ciclo.
 - As listas de adjetivos/verbos do rascunho foram preservadas sem alteracao.
+- **Estado visual (4 LEDs)**: existe sempre no maximo **uma** mensagem. Ao enviar a nova
+  linha, o novo `message_id` e o anterior (guardado como `visualDeletePendingId`) sao
+  persistidos ANTES de apagar o anterior. Se a exclusao falhar, o id fica pendente e nenhuma
+  nova linha e enviada ate a exclusao ser confirmada (as mudancas continuam sendo coalescidas
+  no estado atual); so apos resolver a pendencia a linha atual e enviada. O texto de boot e a
+  linha de boot permanecem inalterados.
 - Comandos: `/reboot` e `/ota` (autorizados por `TELEGRAM_CHAT_ID`).
 
 ## Secrets

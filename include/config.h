@@ -7,7 +7,7 @@
 // -----------------------------------------------------------------------------
 
 // constexpr char FIRMWARE_VERSION[] = "0.9.0";
-constexpr char FIRMWARE_VERSION[] = "1.1.0";
+constexpr char FIRMWARE_VERSION[] = "1.2.0";
 constexpr char DEVICE_ID[] = "DG-01";
 
 // -----------------------------------------------------------------------------

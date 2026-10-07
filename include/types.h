@@ -86,6 +86,13 @@ struct PersistedState {
    // attempt, so a failed download, a power cut or a watchdog reset cannot retry it
    // automatically on the following boot.
    bool otaRequested = false;
+
+   // Visual state message (the four LEDs). Exactly one visual message is kept in
+   // Telegram: lastVisualMessageId is the current one and visualDeletePendingId is a
+   // previous one whose deletion Telegram has not confirmed yet (retried until it
+   // succeeds). Appended at the END so the offsets of the existing fields are unchanged.
+   int32_t lastVisualMessageId = 0;
+   int32_t visualDeletePendingId = 0;
 };
 
 // A ThingsBoard history record: a snapshot associated with a detected change.

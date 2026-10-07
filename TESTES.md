@@ -4,7 +4,8 @@ Observaveis pelo Serial (linha `DIAG ...` a cada 60 s e mensagens de boot/transi
 pelo ThingsBoard (telemetria/atributos) e pelo Telegram.
 
 Campos do `DIAG`: `up` (uptime s), `wifi`, `rssi`, `ntp`, `rede`, `pend` (n pendentes TB),
-`head`, `gap` (tbGapCount), `tgPend`, `tgNotif`, `tgForce`, `tgPhase`, `fallId`, `retId`.
+`head`, `gap` (tbGapCount), `tgPend`, `tgNotif`, `tgForce`, `tgPhase`, `fallId`, `retId`,
+`visId` (id da atual mensagem visual), `visDelId` (id aguardando exclusao, 0 = nenhum).
 
 ## A. Primeiro boot (sem state.bin)
 
@@ -76,6 +77,22 @@ Campos do `DIAG`: `up` (uptime s), `wifi`, `rssi`, `ntp`, `rede`, `pend` (n pend
 
 - Sem Wi-Fi: GPIO continua; transicoes continuam persistidas (`pend` cresce); ao voltar
   o Wi-Fi os eventos sao publicados.
+
+## L. Estado visual (4 LEDs) - substituicao de mensagem
+
+1. Boot: apos o texto de boot, e enviada a linha visual. Se havia uma linha do boot
+   anterior, ela e apagada (existe sempre **uma** so).
+2. Provocar uma mudanca dos 4 sinais: nova linha enviada; a anterior apagada. Confirmar
+   `visId` atualizado e `visDelId` = 0 apos a exclusao.
+3. Mudanca rapida (offgrid ON -> ambos OFF -> gerador ON): coalescing de 3 s => uma unica
+   linha com o estado final.
+4. Durante FALTA/RETORNO (`tgPhase != NONE`): nenhuma linha visual e inserida.
+5. Forcar falha de `deleteMessage()` da linha visual: `visDelId` permanece != 0; nenhuma
+   nova linha visual e enviada enquanto pendente; mudancas continuam coalescidas. Ao
+   restaurar a rede, a exclusao e confirmada (`visDelId` = 0) e a linha atual pendente e
+   enviada.
+6. Reboot com `visDelId` != 0: a exclusao pendente e retomada apos o boot, antes de enviar
+   a nova linha visual de boot.
 ## Rodada corretiva - testes especificos
 
 ### Teste 1 - Payload historico do ThingsBoard
