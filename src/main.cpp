@@ -72,13 +72,18 @@ namespace {
    uint32_t redeFailGraceMillis = 0;
 
    void saveState() {
-      stateStore.save(persisted);
+      if (!stateStore.save(persisted)) {
+         // Diagnostic-only: a failed save would silently lose the persisted ids/state and is
+         // exactly the kind of failure that breaks cross-reboot retention.
+         Serial.printf("[%lu] AVISO: falha ao gravar state.bin\n", static_cast<unsigned long>(millis()));
+      }
    }
 
-   void enqueue(const PowerState &power, const Timestamp &ts) {
+   void enqueue(const PowerState &power, const Timestamp &ts, uint8_t rebootReason = REBOOT_REASON_NONE) {
       PendingRecord record;
       record.timestamp = ts;
       record.power = power;
+      record.rebootReason = rebootReason;
 
       if (!tbQueue.append(record)) {
          persisted.tbGapCount++;
@@ -180,7 +185,52 @@ namespace {
       saveState();
    }
 
+   // Reason of THIS boot, captured once (see currentBootReasonCode()). Kept for the periodic
+   // diagnostic line; the recorded value lives in the mandatory boot snapshot.
+   uint8_t bootReasonCode = REBOOT_REASON_NONE;
+
+   // Compact code of this boot's reason, stored in the mandatory boot snapshot. The OTA flag is
+   // the very same marker the boot notice uses; every other case is classified from the exact
+   // string ESP.getResetReason() returns (the same text the boot notice shows), so the published
+   // "reboot_reason" matches the Telegram notice.
+   uint8_t currentBootReasonCode() {
+      if (persisted.pendingBootReason == BOOT_REASON_OTA) {
+         return REBOOT_REASON_OTA;
+      }
+
+      // Detection is UNCHANGED: it classifies the exact string ESP.getResetReason() returns
+      // (the same source the boot notice always used). Only the DISPLAY is translated to
+      // Portuguese, through rebootReasonDescription().
+      const String reason = ESP.getResetReason();
+
+      if (reason == "Power On") {
+         return REBOOT_REASON_POWER_ON;
+      }
+      if (reason == "Hardware Watchdog") {
+         return REBOOT_REASON_HARDWARE_WATCHDOG;
+      }
+      if (reason == "Exception") {
+         return REBOOT_REASON_EXCEPTION;
+      }
+      if (reason == "Software Watchdog") {
+         return REBOOT_REASON_SOFTWARE_WATCHDOG;
+      }
+      if (reason == "Software/System restart") {
+         return REBOOT_REASON_SOFTWARE_RESTART;
+      }
+      if (reason == "Deep-Sleep Wake") {
+         return REBOOT_REASON_DEEP_SLEEP;
+      }
+      if (reason == "External System") {
+         return REBOOT_REASON_EXTERNAL_SYSTEM;
+      }
+
+      return REBOOT_REASON_UNKNOWN;
+   }
+
    void reconcileBoot() {
+      bootReasonCode = currentBootReasonCode();
+
       const PowerState actual = inputs.state();
 
       if (!persisted.validReliable) {
@@ -194,7 +244,7 @@ namespace {
          persisted.redeFailGraceActive = false;
          persisted.validReliable = true;
 
-         enqueue(actual, timeSource.now());
+         enqueue(actual, timeSource.now(), bootReasonCode);
          saveState();
          return;
       }
@@ -222,7 +272,7 @@ namespace {
          }
 
          // Boot snapshot keeps its usual semantics; no FALTA is recorded here.
-         enqueue(actual, timeSource.now());
+         enqueue(actual, timeSource.now(), bootReasonCode);
          saveState();
          return;
       }
@@ -240,7 +290,7 @@ namespace {
 
          // Boot snapshot keeps its usual semantics; the FALTA stays deferred until
          // the grace window elapses.
-         enqueue(actual, timeSource.now());
+         enqueue(actual, timeSource.now(), bootReasonCode);
          saveState();
          return;
       }
@@ -265,7 +315,7 @@ namespace {
          persisted.alive.redeDisponivel = true;
       }
 
-      enqueue(actual, timeSource.now()); // mandatory boot snapshot
+      enqueue(actual, timeSource.now(), bootReasonCode); // mandatory boot snapshot
       saveState();
    }
 
@@ -525,36 +575,81 @@ namespace {
       }
    }
 
-   // One Telegram message per boot, using the normal sendMessage() infrastructure.
-   // The bootTextSent flag lives in RAM only, so every reset re-arms it; the loop is the
-   // retry mechanism and nothing here blocks the boot (setup() never waits for Telegram).
-   // An OTA reboot is reported by the ESP8266 as a generic software restart, so it is
-   // identified by the marker persisted before the update started (pendingBootReason).
+   // One Telegram reboot notice per boot. Exactly one notice is kept, using the same Model B
+   // as the visual message: the new message_id and the previous one are persisted BEFORE the
+   // previous is deleted, and while a deletion is pending no new notice is created, so orphan
+   // bubbles never accumulate. The content of the message is unchanged.
+   // The bootTextSent flag lives in RAM only, so every reset re-arms it; the loop is the retry
+   // mechanism and nothing here blocks the boot (setup() never waits for Telegram). An OTA
+   // reboot is reported by the ESP8266 as a generic software restart, so it is identified by
+   // the marker persisted before the update started (pendingBootReason).
    void serviceBootNotice() {
-      if (bootTextSent || WiFi.status() != WL_CONNECTED) {
+      if (WiFi.status() != WL_CONNECTED) {
+         return;
+      }
+
+      // A previous notice awaiting its deletion is resolved FIRST - on every pass, even after
+      // this boot's notice was sent. While it is pending no new notice is created (a new one
+      // would only pile up more pending deletions).
+      if (persisted.bootDeletePendingId != 0) {
+         if (telegram.deleteMessage(persisted.bootDeletePendingId)) {
+            persisted.bootDeletePendingId = 0;
+            saveState();
+
+            Serial.printf("[%lu] TG: notificacao de boot anterior apagada (pendente)\n", static_cast<unsigned long>(millis()));
+         } else {
+            return; // keep the id persisted and retry; no new notice while pending
+         }
+      }
+
+      if (bootTextSent) {
          return;
       }
 
       const bool fromUpdate = (persisted.pendingBootReason == BOOT_REASON_OTA);
-      const String reason = fromUpdate ? String("Update/OTA") : ESP.getResetReason();
+      const String reason = rebootReasonDescription(bootReasonCode);
       const String message = String("Monitora_DG reiniciado.\nVersão: ") + FIRMWARE_VERSION + "\nMotivo: " + reason;
 
-      if (telegram.sendText(message)) {
+      int32_t messageId = 0;
+
+      if (telegram.sendText(message, messageId) && messageId > 0) {
+         const int32_t previousId = persisted.lastBootMessageId;
+
+         // Persist the new id (and the previous one as pending) BEFORE deleting, so a failure
+         // between the two steps can never lose the current reboot notice.
+         persisted.lastBootMessageId = messageId;
+         persisted.bootDeletePendingId = (previousId > 0 && previousId != messageId) ? previousId : 0;
+
+         // Consume the OTA marker only after the message was actually delivered, together with
+         // the ids, in a single save.
+         if (fromUpdate) {
+            persisted.pendingBootReason = BOOT_REASON_NONE;
+         }
+
+         saveState();
+
          bootTextSent = true;
          // The visual line follows the boot text (serviceVisualNotice(), same loop pass) and
          // is exempt from the stability window.
          visualPending = true;
          visualBootPending = true;
 
-         // Consume the marker only after the message was actually delivered, then persist
-         // the cleared state so the next boot reports the real reset reason again.
-         if (fromUpdate) {
-            persisted.pendingBootReason = BOOT_REASON_NONE;
-            saveState();
-         }
+         Serial.printf("[%lu] TG: notificacao de boot enviada (motivo=%s) id=%ld\n", static_cast<unsigned long>(millis()),
+                       rebootReasonDescription(bootReasonCode), static_cast<long>(messageId));
 
-         Serial.printf("[%lu] TG: notificacao de boot enviada (motivo=%s)\n", static_cast<unsigned long>(millis()),
-                       fromUpdate ? "Update/OTA" : "reset");
+         // Replace the previous reboot notice. If the deletion fails, its id stays persisted
+         // and the next pass retries it (blocking any new notice until then).
+         if (persisted.bootDeletePendingId != 0) {
+            if (telegram.deleteMessage(persisted.bootDeletePendingId)) {
+               persisted.bootDeletePendingId = 0;
+               saveState();
+
+               Serial.printf("[%lu] TG: notificacao de boot anterior apagada\n", static_cast<unsigned long>(millis()));
+            } else {
+               Serial.printf("[%lu] TG: notificacao de boot anterior: apagar falhou id=%ld\n", static_cast<unsigned long>(millis()),
+                             static_cast<long>(persisted.bootDeletePendingId));
+            }
+         }
       }
    }
 
@@ -645,6 +740,10 @@ namespace {
                     persisted.tgForceNotify ? 1 : 0, phaseName(persisted.tgPhase), static_cast<long>(persisted.lastFallStickerId),
                     static_cast<long>(persisted.lastReturnStickerId), static_cast<long>(persisted.lastVisualMessageId),
                     static_cast<long>(persisted.visualDeletePendingId));
+
+      Serial.printf("[%lu] BOOT DIAG: bootId=%ld bootDelId=%ld reason=%s\n", static_cast<unsigned long>(now),
+                    static_cast<long>(persisted.lastBootMessageId), static_cast<long>(persisted.bootDeletePendingId),
+                    rebootReasonDescription(bootReasonCode));
    }
 } // namespace
 

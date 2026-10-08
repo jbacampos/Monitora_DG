@@ -7,7 +7,7 @@
 // -----------------------------------------------------------------------------
 
 // constexpr char FIRMWARE_VERSION[] = "0.9.0";
-constexpr char FIRMWARE_VERSION[] = "1.2.0";
+constexpr char FIRMWARE_VERSION[] = "1.3.0";
 constexpr char DEVICE_ID[] = "DG-01";
 
 // -----------------------------------------------------------------------------
@@ -131,3 +131,8 @@ constexpr char KEY_TS_UNKNOWN[]   = "ts_unknown";
 constexpr char KEY_LAST_ALIVE[]   = "last_alive";
 constexpr char KEY_UPTIME[]       = "uptime_s";
 constexpr char KEY_WIFI_RSSI[]    = "wifi_rssi";
+
+// Historical marker of a boot/reboot: the NUMERIC code of the reason (see RebootReason in
+// types.h; the human-Portuguese text is only for Telegram/Serial). Published only with the
+// mandatory boot snapshot; ordinary transitions never carry it.
+constexpr char KEY_REBOOT_REASON[] = "reboot_reason";

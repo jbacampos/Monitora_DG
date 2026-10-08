@@ -6,6 +6,8 @@ pelo ThingsBoard (telemetria/atributos) e pelo Telegram.
 Campos do `DIAG`: `up` (uptime s), `wifi`, `rssi`, `ntp`, `rede`, `pend` (n pendentes TB),
 `head`, `gap` (tbGapCount), `tgPend`, `tgNotif`, `tgForce`, `tgPhase`, `fallId`, `retId`,
 `visId` (id da atual mensagem visual), `visDelId` (id aguardando exclusao, 0 = nenhum).
+Na linha `BOOT DIAG` adicional: `bootId` (id da atual mensagem de reinicio), `bootDelId` (id de
+reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da mensagem).
 
 ## A. Primeiro boot (sem state.bin)
 
@@ -153,9 +155,82 @@ Campos do `DIAG`: `up` (uptime s), `wifi`, `rssi`, `ntp`, `rede`, `pend` (n pend
 
 ### Teste 7 - Tamanho do PendingRecord
 
-1. `static_assert(sizeof(PendingRecord) == 12, ...)` presente em `include/types.h`.
+1. `static_assert(sizeof(PendingRecord) == 16, ...)` presente em `include/types.h`
+   (`Timestamp` 8 B + `PowerState` 4 B + `rebootReason` 1 B + 3 B de alinhamento).
 2. `pio run` compila com SUCCESS (o static_assert e verificado na compilacao).
-3. Estimativa de capacidade: 12 B/registro => ~43.000 registros em 512 KiB (inalterada).
+3. Estimativa de capacidade: 16 B/registro => ~32.000 registros em 512 KiB (mais 4 B de
+   cabecalho de formato), reduzida pelo novo campo `rebootReason` e aceita.
+
+## Rodada - motivo do reinicio no ThingsBoard e retencao do aviso de boot
+
+### Teste R1 - Cada boot publica o codigo do motivo (`reboot_reason`)
+
+1. Reinicie o modulo por power-on, por `/reboot` e por watchdog, com NTP disponivel.
+2. Em `v1/devices/me/telemetry`, confirmar **um** payload por boot com as quatro chaves de
+   estado e adicionalmente `reboot_reason` **numerico**, conforme a tabela do README:
+   power-on = 1, `/reboot` = 5, watchdog = 4 (software) ou 2 (hardware), OTA = 9.
+3. No Telegram, confirmar que a mensagem de boot mostra a descricao em portugues correspondente
+   (ex.: `Motivo: Reinício por software`). O Serial (`BOOT DIAG`: `reason=`) usa a mesma tabela.
+
+### Teste R2 - Dois reboots consecutivos com o mesmo motivo
+
+1. Reinicie duas vezes por `/reboot`.
+2. Confirmar **dois** payloads distintos, ambos com `reboot_reason = 5`, cada um com o
+   timestamp do respectivo boot.
+
+### Teste R3 - Boot com Wi-Fi/ThingsBoard indisponivel
+
+1. Reinicie sem Wi-Fi (ou com o TB fora).
+2. Confirmar que `pend` cresce com o snapshot de boot (a publicacao fica em `pending.bin`).
+3. Restaurar a conectividade: o snapshot e publicado com o **codigo original** do motivo e o
+   **timestamp original** do boot, em **ordem cronologica**. Nada e descartado em silencio.
+
+### Teste R4 - Transicoes normais sem `reboot_reason`
+
+1. Provoque transicoes dos 4 sinais.
+2. Confirmar que os payloads de transicao continuam **sem** `reboot_reason` (formato do
+   Teste 1) e que o widget 2 continua exibindo somente as 4 series de estado.
+
+### Teste R5 - Migracao do `pending.bin` legado
+
+1. Gravar um `pending.bin` no formato antigo (12 B/registro, sem cabecalho).
+2. Iniciar o firmware novo. Confirmar no Serial:
+   `pending.bin: formato antigo (12B) migrado para 16B; historico preservado.`
+3. Confirmar que **todos** os registros antigos foram preservados (`pend` igual ao anterior) e
+   publicados em ordem, **sem** `reboot_reason`.
+
+### Teste R6 - Retencao da mensagem de reinicio no Telegram
+
+1. Boot 1 (sem mensagem anterior): nova mensagem enviada; `bootId` != 0; `bootDelId` = 0. No
+   Serial: `TG: sendMessage chat_id=... result.message_id=N` e nenhum `deleteMessage`.
+2. Boot 2: nova mensagem enviada; `bootId` atualizado; a mensagem do boot 1 e apagada. No Serial:
+   `TG: deleteMessage envio ... message_id=<antigo>` e `deleteMessage resposta ok=1 error_code=0`;
+   `bootDelId` volta a 0. No Telegram existe **uma** mensagem de reinicio.
+3. Envio da nova mensagem falha (rede cai durante o `sendMessage`): a mensagem anterior
+   **nao** e apagada; `bootId`/`bootDelId` inalterados; o envio e repetido depois.
+4. Envio OK mas `deleteMessage()` recusado (`{"ok":false,...}`): no Serial
+   `deleteMessage resposta ok=0 error_code=...`; persistir `bootDelId`; **nenhuma** nova mensagem
+   de reinicio e criada enquanto pendente.
+5. `deleteMessage` respondendo `message to delete not found`: no Serial
+   `deleteMessage ja_inexistente id=...`; conta como sucesso (ja nao existe), mas se aparecer
+   repetidamente indica que o id persistido nao e de uma mensagem viva (investigar).
+6. Um HTTP 200 com `{"ok":false,...}` **nao** pode ser contado como sucesso (`request()` nao
+   mascara mais; `deleteMessage` exige `"result":true`).
+7. Reboot com `bootDelId` != 0: apos o boot, a exclusao pendente e resolvida **primeiro**;
+   so depois a nova mensagem de reinicio e enviada.
+8. Independencia: FALTA/RETORNO (stickers/textos) e a linha visual dos 4 LEDs nao sao afetados;
+   `visId`/`visDelId` permanecem independentes de `bootId`/`bootDelId`; `sendSticker` tambem
+   registra `chat_id`.
+9. Confirmar no Serial que `saveState()` nunca registra `AVISO: falha ao gravar state.bin`
+   (uma falha de gravacao perderia os IDs entre reboots e quebraria a retencao).
+
+### Teste R7 - Retencao da linha visual (4 LEDs)
+
+1. Boot: apos o texto de boot e enviada a linha visual; `visId` != 0; `visDelId` = 0.
+2. Boot seguinte: nova linha; a anterior apagada (`visDelId` volta a 0). Existe **uma** linha.
+3. `deleteMessage()` da linha recusado: `visDelId` persistido; nenhuma linha nova enquanto
+   pendente; ao restaurar, a exclusao e confirmada e so entao a linha atual e enviada.
+4. Uma mudanca dos 4 sinais gera nova linha e apaga a anterior (sem `AVISO: falha ao gravar state.bin`).
 
 ## Rodada de diagnostico - heap antes do Telegram
 

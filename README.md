@@ -44,8 +44,12 @@ src/
 
 - `/state.bin` = um unico `PersistedState`, escrito em `/state.tmp` e depois `rename`
   (o rename do LittleFS substitui o destino de forma atomica). Sem CRC e sem slots A/B.
-- `/pending.bin` = log **append-only** de `PendingRecord`. O `tbLogHead` (em `state.bin`)
-  aponta o proximo registro a publicar. O arquivo so e truncado quando a fila drena.
+- `/pending.bin` = log **append-only** de `PendingRecord` (16 B: `Timestamp` 8 + `PowerState`
+  4 + `rebootReason` 1 + 3 de alinhamento), precedido por um cabecalho de formato de 4 B
+  (`PENDING_MAGIC`). O `tbLogHead` (em `state.bin`) aponta o proximo registro a publicar. O
+  arquivo so e truncado quando a fila drena. Um `pending.bin` no formato antigo (12 B, sem
+  cabecalho) e migrado no boot para o formato atual, preservando todos os registros (com
+  `rebootReason` = NONE).
 - Um `.tmp` orfao nunca impede a operacao.
 
 ## Timestamps
@@ -81,6 +85,24 @@ um snapshot obrigatorio dos quatro estados para o ThingsBoard.
 
 - `v1/devices/me/telemetry`: cada transicao confirmada gera um snapshot dos 4 estados com
   o timestamp original; eventos pendentes sao enviados em ordem cronologica.
+- **Historico de reinicios**: em todo boot o snapshot obrigatorio carrega adicionalmente a
+  chave `reboot_reason` com o **codigo NUMERICO** do motivo (tabela abaixo); as transicoes
+  normais nunca a possuem. No Telegram/Serial o mesmo codigo vira a descricao em portugues
+  (tabela unica `rebootReasonDescription()`). Como usa a mesma fila `pending.bin`, a publicacao
+  e at-least-once, funciona sem Wi-Fi, mantem o timestamp original do boot e respeita a ordem
+  cronologica.
+
+  | codigo | motivo (`ESP.getResetReason()` / OTA) | descricao (pt-BR) |
+  |---|---|---|
+  | 1 | `Power On` | Energização (power-on) |
+  | 2 | `Hardware Watchdog` | Watchdog de hardware |
+  | 3 | `Exception` | Exceção |
+  | 4 | `Software Watchdog` | Watchdog de software |
+  | 5 | `Software/System restart` | Reinício por software |
+  | 6 | `Deep-Sleep Wake` | Despertar de deep sleep |
+  | 7 | `External System` | Reset externo |
+  | 8 | `Unknown` | Desconhecido |
+  | 9 | OTA (`pendingBootReason`) | Atualização (OTA) |
 - `v1/devices/me/attributes`: heartbeat de supervisao (~60 s) com `last_alive`,
   `uptime_s`, `wifi_rssi`. O `last_alive` do TB **nao** e usado para reconstrucao.
 - Fila persistente append-only (orcamento ~512 KB => dezenas de milhares de eventos).
@@ -105,6 +127,12 @@ um snapshot obrigatorio dos quatro estados para o ThingsBoard.
   nova linha e enviada ate a exclusao ser confirmada (as mudancas continuam sendo coalescidas
   no estado atual); so apos resolver a pendencia a linha atual e enviada. O texto de boot e a
   linha de boot permanecem inalterados.
+- **Mensagem de reinicio**: existe sempre no maximo **uma**. Mesmo esquema (Model B) da linha
+  visual: o novo `message_id` e o anterior (`bootDeletePendingId`) sao persistidos ANTES de
+  apagar o anterior; enquanto uma exclusao estiver pendente nenhuma nova mensagem de reinicio e
+  criada. A exclusao so conta como confirmada quando a API responde `{"ok":true,"result":true}`
+  (nao basta um HTTP 200: `{"ok":false,...}` e falha). O conteudo da mensagem de boot permanece
+  inalterado (o motivo aparece em portugues). Independente de FALTA/RETORNO e da linha visual.
 - Comandos: `/reboot` e `/ota` (autorizados por `TELEGRAM_CHAT_ID`).
 
 ## Secrets

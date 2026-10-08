@@ -73,17 +73,27 @@ bool Telemetry::publishEvent(const PendingRecord &record) {
 
    // ThingsBoard historical telemetry uses the { "ts": ..., "values": {...} } form.
    // ts is the ORIGINAL event time (never the transmission time).
+   //
+   // A boot snapshot (rebootReason != NONE) additionally carries "reboot_reason": the NUMERIC
+   // code of the reboot reason (see RebootReason in types.h). Ordinary transitions keep the
+   // exact previous payload (no reboot_reason key). The Portuguese text is only for Telegram.
+   char reasonField[32] = "";
+
+   if (record.rebootReason != REBOOT_REASON_NONE) {
+      snprintf(reasonField, sizeof(reasonField), ",\"%s\":%u", KEY_REBOOT_REASON, static_cast<unsigned>(record.rebootReason));
+   }
+
    if (record.timestamp.kind == TsKind::Epoch) {
       const unsigned long long ms = static_cast<unsigned long long>(record.timestamp.value) * 1000ULL;
 
-      snprintf(payloadBuffer, sizeof(payloadBuffer), "{\"%s\":%llu,\"values\":{\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d}}", KEY_TS, ms, KEY_REDE_DISP,
+      snprintf(payloadBuffer, sizeof(payloadBuffer), "{\"%s\":%llu,\"values\":{\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d%s}}", KEY_TS, ms, KEY_REDE_DISP,
                s.redeDisponivel ? 1 : 0, KEY_ALIM_REDE, s.alimentacaoRede ? 1 : 0, KEY_ALIM_OFFGRID, s.alimentacaoOffgrid ? 1 : 0, KEY_ALIM_GERADOR,
-               s.alimentacaoGerador ? 1 : 0);
+               s.alimentacaoGerador ? 1 : 0, reasonField);
    } else {
       // LostSession: the absolute time is unknown. Never fabricate an epoch.
-      snprintf(payloadBuffer, sizeof(payloadBuffer), "{\"%s\":true,\"values\":{\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d}}", KEY_TS_UNKNOWN, KEY_REDE_DISP,
+      snprintf(payloadBuffer, sizeof(payloadBuffer), "{\"%s\":true,\"values\":{\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d%s}}", KEY_TS_UNKNOWN, KEY_REDE_DISP,
                s.redeDisponivel ? 1 : 0, KEY_ALIM_REDE, s.alimentacaoRede ? 1 : 0, KEY_ALIM_OFFGRID, s.alimentacaoOffgrid ? 1 : 0, KEY_ALIM_GERADOR,
-               s.alimentacaoGerador ? 1 : 0);
+               s.alimentacaoGerador ? 1 : 0, reasonField);
    }
 
    return publish(TB_TELEMETRY_TOPIC, payloadBuffer);

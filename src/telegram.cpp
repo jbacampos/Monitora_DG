@@ -607,11 +607,14 @@ bool Telegram::request(
       tgReuseSuccess++;
    }
 
-   // `response` now holds the body only, so the previous JSON based verdict is
-   // unchanged; the connection stays open for the next operation.
-   const bool ok = response.indexOf("{\"ok\"") >= 0;
+   // `response` now holds the body only, and the CALLEE parses the Telegram verdict from it.
+   // A body that merely CONTAINS {"ok" (including {"ok":false,...} at HTTP 200) is NOT a
+   // success: the value returned here is only "a well-formed HTTP reply arrived". The previous
+   // form (indexOf("{\"ok\"") >= 0) marked every API error as ok=true, which masked real
+   // failures behind an HTTP 200.
+   const bool apiOk = response.indexOf("\"ok\":true") >= 0;
 
-   httpLog(method.c_str(), ok, status, httpStart);
+   httpLog(method.c_str(), apiOk, status, httpStart);
    httpResponseLog(method.c_str(), response, status, httpStart);
 
    heapLog(method.c_str(), "pos-resposta");
@@ -624,7 +627,7 @@ bool Telegram::request(
       dropTgConnection();
    }
 
-   return ok;
+   return framed;
 }
 
 bool Telegram::sendText(const String &message) {
@@ -664,8 +667,10 @@ bool Telegram::sendMessageInternal(const String &message, int32_t *outId) {
    if (outId != nullptr) {
       *outId = doc["result"]["message_id"] | 0;
 
-      // Diagnostic-only: confirm the exact API field that feeds lastVisualMessageId.
-      Serial.printf("[%lu] TG: sendMessage result.message_id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(*outId));
+      // Diagnostic-only: the exact chat the message went to and the id that will later be
+      // deleted (chat_id is not the token).
+      Serial.printf("[%lu] TG: sendMessage chat_id=%s result.message_id=%ld\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
+                    static_cast<long>(*outId));
    }
 
    return true;
@@ -696,9 +701,10 @@ bool Telegram::sendSticker(const String &stickerId, int32_t &messageId) {
 
    messageId = doc["result"]["message_id"] | 0;
 
-   // Diagnostic-only: confirm the exact API field that feeds lastFallStickerId /
-   // lastReturnStickerId in TelegramNotifier.
-   Serial.printf("[%lu] TG: sendSticker result.message_id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
+   // Diagnostic-only: the exact chat the sticker went to and the id that feeds
+   // lastFallStickerId / lastReturnStickerId in TelegramNotifier (chat_id is not the token).
+   Serial.printf("[%lu] TG: sendSticker chat_id=%s result.message_id=%ld\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
+                 static_cast<long>(messageId));
 
    return messageId > 0;
 }
@@ -716,7 +722,13 @@ bool Telegram::deleteMessage(int32_t messageId) {
       "chat_id=" + urlEncode(TELEGRAM_CHAT_ID) +
       "&message_id=" + String(messageId);
 
+   // Diagnostic-only: the exact target of this deletion (chat_id is not the token).
+   Serial.printf("[%lu] TG: deleteMessage envio chat_id=%s message_id=%ld\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
+                 static_cast<long>(messageId));
+
    if (!request("deleteMessage", query, response)) {
+      // The transport failure was already logged by request().
+      Serial.printf("[%lu] TG: deleteMessage transporte_falhou id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
       return false;
    }
 
@@ -724,28 +736,42 @@ bool Telegram::deleteMessage(int32_t messageId) {
 
    if (deserializeJson(doc, response.substring(response.indexOf("{\"ok\"")))) {
       // Diagnostic-only: the reply body was not parseable JSON.
-      Serial.printf("[%lu] TG: deleteMessage json_nao_parseavel id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
+      Serial.printf("[%lu] TG: deleteMessage json_nao_parseavel id=%ld body=\"%s\"\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId),
+                    diagBody(response).c_str());
       return false;
    }
 
    const bool apiOk = doc["ok"] | false;
-
-   // Diagnostic-only: the parsed API verdict for this deletion.
-   Serial.printf("[%lu] TG: deleteMessage resultado_api ok=%d id=%ld\n", static_cast<unsigned long>(millis()), apiOk ? 1 : 0, static_cast<long>(messageId));
-
-   if (apiOk) {
-      return true;
-   }
-
-   // Telegram answers this specific error when the target message no longer
-   // exists: the deletion is already satisfied, so it counts as a logical success
-   // and TelegramNotifier::stepDelOld() clears the stored id and advances phase
-   // exactly as after a confirmed deletion. Every other outcome (other API error,
-   // other HTTP status, transport failure) keeps the current retry behaviour.
    const int errorCode = doc["error_code"] | 0;
    const String description = doc["description"] | "";
 
+   // Diagnostic-only: the parsed API verdict for this deletion.
+   Serial.printf("[%lu] TG: deleteMessage resposta ok=%d error_code=%d description=\"%s\" id=%ld\n", static_cast<unsigned long>(millis()), apiOk ? 1 : 0,
+                 errorCode, description.c_str(), static_cast<long>(messageId));
+
+   if (apiOk) {
+      // Telegram answers {"ok":true,"result":true} for a real deletion. Requiring the boolean
+      // result rejects a foreign/replayed body that merely carries "ok":true (for example a
+      // stale sendMessage reply read on a reused connection), which would otherwise be counted
+      // as a deletion that never happened - exactly what let duplicates accumulate.
+      const bool deleted = doc["result"] | false;
+
+      if (!deleted) {
+         Serial.printf("[%lu] TG: deleteMessage ok_sem_result id=%ld (a exclusao NAO foi confirmada)\n", static_cast<unsigned long>(millis()),
+                       static_cast<long>(messageId));
+      }
+
+      return deleted;
+   }
+
+   // Telegram answers this specific error when the target message no longer exists: the
+   // deletion is already satisfied, so it counts as a logical success and
+   // TelegramNotifier::stepDelOld() clears the stored id and advances phase exactly as after
+   // a confirmed deletion. Every other outcome (other API error, other HTTP status, transport
+   // failure) keeps the current retry behaviour.
    if (errorCode == 400 && description.indexOf("message to delete not found") >= 0) {
+      // Logged distinctly: hitting this repeatedly means the stored id does not match a live
+      // message, which must be investigated (it is NOT a normal success path).
       Serial.printf("[%lu] TG: deleteMessage ja_inexistente id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
       return true;
    }

@@ -6,12 +6,16 @@ class TimeSource;
 
 // Append-only ThingsBoard history log stored in LittleFS (PENDING_FILE).
 //
-// Records are consumed strictly in order through an external head index kept in
-// PersistedState (tbLogHead). The file is only truncated when the queue is fully
-// drained, so history is never silently dropped.
+// The file starts with a 4-byte format header (PENDING_MAGIC) followed by PendingRecord
+// records. The header lets a legacy file (12-byte records, written before the reboot history
+// existed) be told apart unambiguously and upgraded in place by begin(), so history written
+// by an older firmware is preserved instead of being misread. Records are consumed strictly
+// in order through an external head index kept in PersistedState (tbLogHead). The file is
+// only truncated when the queue is fully drained, so history is never silently dropped.
 class TbQueue {
 public:
-   // Repairs a partially written tail left by a power loss during an append.
+   // Repairs a partially written tail left by a power loss during an append and upgrades a
+   // legacy (12-byte-record) file to the current format.
    bool begin();
 
    uint32_t count() const;
@@ -36,4 +40,8 @@ private:
    enum class Transform { Copy, ToLost, Resolve };
 
    bool transformRecords(Transform mode, const TimeSource *time, uint32_t fromIndex);
+
+   // One-time upgrade of a legacy pending.bin (12-byte records, no header) to the current
+   // 16-byte format, preserving every complete record (rebootReason = NONE).
+   bool migrateLegacyFormat();
 };
