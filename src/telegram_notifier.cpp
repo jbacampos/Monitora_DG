@@ -2,6 +2,7 @@
 
 #include <ESP8266WiFi.h>
 
+#include "config.h"
 #include "secrets.h"
 #include "state_store.h"
 #include "telegram.h"
@@ -163,6 +164,23 @@ void TelegramNotifier::update() {
       seqStartMillis_ = millis();
    }
 
+   // Retry gate. A step that failed is not repeated on the next loop pass: each attempt is a
+   // full TLS round-trip and a group chat accepts only 20 messages per minute, so retrying
+   // every pass made a transient error worse (429 flood) instead of fixing it. Any phase change
+   // clears the gate, so a sequence that is actually advancing is never delayed.
+   const uint8_t phase = state_->tgPhase;
+
+   if (phase != stepPhase_) {
+      stepPhase_ = phase;
+      stepAttempts_ = 0;
+      retryDelayMs_ = 0;
+      retryPending_ = false;
+   }
+
+   if (retryPending_ && static_cast<int32_t>(millis() - nextAttemptMillis_) < 0) {
+      return;
+   }
+
    const uint8_t phaseBefore = state_->tgPhase;
 
    switch (state_->tgPhase) {
@@ -192,9 +210,63 @@ void TelegramNotifier::update() {
    // A step that did not move the sequence forward failed. If Telegram refused it with an
    // error that no retry can change (bad token, chat not found, no rights to send, invalid
    // sticker), the sequence is abandoned instead of being retried forever: the persisted
-   // phase would never be released and the command poll waits for it.
-   if (state_->tgPhase == phaseBefore && telegram_->lastErrorFatal()) {
-      abortSequence("erro fatal da API");
+   // phase would never be released and the command poll waits for it. Any other failure is
+   // retried after the backoff delay below.
+   if (state_->tgPhase == phaseBefore) {
+      if (telegram_->lastErrorFatal()) {
+         abortSequence("erro fatal da API");
+      } else {
+         scheduleRetry();
+      }
+   } else {
+      stepPhase_ = state_->tgPhase;
+      stepAttempts_ = 0;
+      retryDelayMs_ = 0;
+      retryPending_ = false;
+   }
+}
+
+void TelegramNotifier::scheduleRetry() {
+   if (stepAttempts_ < 0xFFFF) {
+      stepAttempts_++;
+   }
+
+   // 3 s, 6 s, 12 s, 24 s, 48 s, 60 s, 60 s, ...
+   uint16_t shifts = (stepAttempts_ > 0) ? static_cast<uint16_t>(stepAttempts_ - 1) : 0;
+
+   if (shifts > 6) {
+      shifts = 6;
+   }
+
+   uint32_t delayMs = TELEGRAM_RETRY_BACKOFF_MIN_MS << shifts;
+
+   if (delayMs > TELEGRAM_RETRY_BACKOFF_MAX_MS) {
+      delayMs = TELEGRAM_RETRY_BACKOFF_MAX_MS;
+   }
+
+   // Telegram's own retry_after (429 flood limit) wins when it asks for more, bounded by
+   // TELEGRAM_RETRY_AFTER_MAX_S.
+   uint32_t retryAfterMs = static_cast<uint32_t>(telegram_->lastRetryAfterSeconds()) * 1000UL;
+
+   if (retryAfterMs > (TELEGRAM_RETRY_AFTER_MAX_S * 1000UL)) {
+      retryAfterMs = TELEGRAM_RETRY_AFTER_MAX_S * 1000UL;
+   }
+
+   if (retryAfterMs > delayMs) {
+      delayMs = retryAfterMs;
+   }
+
+   retryPending_ = true;
+   retryDelayMs_ = delayMs;
+   nextAttemptMillis_ = millis() + delayMs;
+
+   Serial.printf("[%lu] TG: retry fase=%s tentativa=%u em=%lums error_code=%d\n", static_cast<unsigned long>(millis()), tgPhaseName(state_->tgPhase),
+                 stepAttempts_, static_cast<unsigned long>(retryDelayMs_), telegram_->lastErrorCode());
+
+   // Attempt budget: a step that keeps failing is given up on, so the phase can never park the
+   // command poll forever.
+   if (stepAttempts_ >= TELEGRAM_MAX_STEP_ATTEMPTS) {
+      abortSequence("tentativas esgotadas");
    }
 }
 

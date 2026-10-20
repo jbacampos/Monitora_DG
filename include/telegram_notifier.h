@@ -44,6 +44,20 @@ private:
    // Never persisted, never used for control flow.
    uint32_t seqStartMillis_ = 0;
 
+   // Retry gate, RAM only (a reboot resumes the persisted phase and retries immediately).
+   // It keeps a failing step from being repeated on every loop pass: nextAttemptMillis_ is the
+   // earliest instant the step may run again, stepAttempts_ counts the consecutive failures of
+   // the phase in stepPhase_ and retryDelayMs_ is the delay in use (reported in the log).
+   uint32_t nextAttemptMillis_ = 0;
+   uint16_t stepAttempts_ = 0;
+   uint32_t retryDelayMs_ = 0;
+   uint8_t stepPhase_ = TG_PHASE_NONE;
+   bool retryPending_ = false;
+
+   // Applies the backoff curve, honours Telegram's retry_after and abandons the sequence when
+   // the attempt budget of the current step is exhausted.
+   void scheduleRetry();
+
    void save();
    void startSequence();
    void pickIndices(bool returnOfEnergy);

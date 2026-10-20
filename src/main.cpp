@@ -481,6 +481,68 @@ namespace {
       return String(line);
    }
 
+   // Telegram retry gate shared by the boot notice and the LED line. A failed send must not be
+   // repeated on every loop pass: each attempt is a TLS round-trip and a group chat accepts only
+   // 20 messages per minute, so a burst only adds 429 (message flood) to the original problem.
+   // Same curve as TelegramNotifier: 3 s doubling up to 60 s, plus Telegram's retry_after.
+   bool tgRetryPending = false;
+   uint32_t tgRetryNextMillis = 0;
+   uint16_t tgRetryAttempts = 0;
+
+   // True while the delay of a previous failure is still running.
+   bool telegramRetryWaiting() {
+      if (!tgRetryPending) {
+         return false;
+      }
+
+      if (static_cast<int32_t>(millis() - tgRetryNextMillis) < 0) {
+         return true;
+      }
+
+      tgRetryPending = false;
+      return false;
+   }
+
+   // A step succeeded (or was abandoned): the next one runs immediately.
+   void telegramRetryClear() {
+      tgRetryPending = false;
+      tgRetryAttempts = 0;
+   }
+
+   void telegramRetrySchedule(const char *label) {
+      if (tgRetryAttempts < 0xFFFF) {
+         tgRetryAttempts++;
+      }
+
+      uint16_t shifts = (tgRetryAttempts > 0) ? static_cast<uint16_t>(tgRetryAttempts - 1) : 0;
+
+      if (shifts > 6) {
+         shifts = 6;
+      }
+
+      uint32_t delayMs = TELEGRAM_RETRY_BACKOFF_MIN_MS << shifts;
+
+      if (delayMs > TELEGRAM_RETRY_BACKOFF_MAX_MS) {
+         delayMs = TELEGRAM_RETRY_BACKOFF_MAX_MS;
+      }
+
+      uint32_t retryAfterMs = static_cast<uint32_t>(telegram.lastRetryAfterSeconds()) * 1000UL;
+
+      if (retryAfterMs > (TELEGRAM_RETRY_AFTER_MAX_S * 1000UL)) {
+         retryAfterMs = TELEGRAM_RETRY_AFTER_MAX_S * 1000UL;
+      }
+
+      if (retryAfterMs > delayMs) {
+         delayMs = retryAfterMs;
+      }
+
+      tgRetryPending = true;
+      tgRetryNextMillis = millis() + delayMs;
+
+      Serial.printf("[%lu] TG: retry %s em=%lums tentativa=%u\n", static_cast<unsigned long>(millis()), label,
+                    static_cast<unsigned long>(delayMs), tgRetryAttempts);
+   }
+
    // Resolves a persisted message id awaiting deletion. Returns true when the id no longer
    // blocks the caller, which must then clear it and persist: Telegram confirmed the deletion,
    // the message was already gone, or Telegram refused it permanently (message older than
@@ -526,6 +588,10 @@ namespace {
          return;
       }
 
+      if (telegramRetryWaiting()) {
+         return; // a previous failure is still backing off
+      }
+
       if (persisted.tgPhase != TG_PHASE_NONE) {
          return;
       }
@@ -540,6 +606,7 @@ namespace {
 
             Serial.printf("[%lu] TG: LEDs antigos apagados (pendente)\n", static_cast<unsigned long>(millis()));
          } else {
+            telegramRetrySchedule("LEDs antigos");
             return; // keep the id persisted and retry before sending a new line
          }
       }
@@ -572,6 +639,8 @@ namespace {
       int32_t messageId = 0;
 
       if (telegram.sendText(visualLine(current), messageId) && messageId > 0) {
+         telegramRetryClear();
+
          const int32_t previousId = persisted.lastVisualMessageId;
 
          // Persist the new id and the previous one BEFORE deleting: a failure between the
@@ -599,6 +668,7 @@ namespace {
             } else {
                Serial.printf("[%lu] TG: LEDs antigos: apagar falhou id=%ld\n", static_cast<unsigned long>(millis()),
                              static_cast<long>(persisted.visualDeletePendingId));
+               telegramRetrySchedule("LEDs antigos");
             }
          }
       } else {
@@ -610,6 +680,7 @@ namespace {
                           static_cast<unsigned long>(millis()), telegram.lastErrorCode());
          } else {
             visualPending = true; // retry with the state detected then
+            telegramRetrySchedule("LEDs");
          }
       }
    }
@@ -627,6 +698,10 @@ namespace {
          return;
       }
 
+      if (telegramRetryWaiting()) {
+         return; // a previous failure is still backing off
+      }
+
       // A previous notice awaiting its deletion is resolved FIRST - on every pass, even after
       // this boot's notice was sent. While it is pending no new notice is created (a new one
       // would only pile up more pending deletions).
@@ -637,6 +712,7 @@ namespace {
 
             Serial.printf("[%lu] TG: notificacao de boot anterior apagada (pendente)\n", static_cast<unsigned long>(millis()));
          } else {
+            telegramRetrySchedule("notificacao de boot anterior");
             return; // keep the id persisted and retry; no new notice while pending
          }
       }
@@ -652,6 +728,8 @@ namespace {
       int32_t messageId = 0;
 
       if (telegram.sendText(message, messageId) && messageId > 0) {
+         telegramRetryClear();
+
          const int32_t previousId = persisted.lastBootMessageId;
 
          // Persist the new id (and the previous one as pending) BEFORE deleting, so a failure
@@ -687,6 +765,7 @@ namespace {
             } else {
                Serial.printf("[%lu] TG: notificacao de boot anterior: apagar falhou id=%ld\n", static_cast<unsigned long>(millis()),
                              static_cast<long>(persisted.bootDeletePendingId));
+               telegramRetrySchedule("notificacao de boot anterior");
             }
          }
       } else if (telegram.lastErrorFatal()) {
@@ -695,6 +774,8 @@ namespace {
          bootNoticeAbandoned = true;
          Serial.printf("[%lu] TG: aviso de boot abandonado neste boot (error_code=%d sem recuperacao possivel)\n",
                        static_cast<unsigned long>(millis()), telegram.lastErrorCode());
+      } else {
+         telegramRetrySchedule("aviso de boot");
       }
    }
 

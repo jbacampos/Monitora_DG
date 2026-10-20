@@ -94,6 +94,34 @@ constexpr uint32_t TELEGRAM_RESPONSE_TIMEOUT_MS = 6000UL;
 constexpr uint32_t TELEGRAM_REUSE_MIN_GAP_MS = 700;
 
 // -----------------------------------------------------------------------------
+// Telegram retry policy
+//
+// A failed operation used to be retried on the next loop pass. Every attempt is a
+// full TLS round-trip and Telegram limits a group chat to 20 messages per minute,
+// so a burst turns one transient error into `429 Too Many Requests` (message
+// flood) and keeps the device busy with no benefit. The delay grows
+// 3 s -> 6 s -> 12 s -> 24 s -> 48 s -> 60 s (cap) and is applied per step, so a
+// step that was already delivered is never repeated.
+// -----------------------------------------------------------------------------
+
+constexpr uint32_t TELEGRAM_RETRY_BACKOFF_MIN_MS = 3000UL;
+constexpr uint32_t TELEGRAM_RETRY_BACKOFF_MAX_MS = 60000UL;
+
+// Telegram's own `parameters.retry_after` (429) is honoured, but bounded so a bogus
+// value cannot park the notifier for hours.
+constexpr uint32_t TELEGRAM_RETRY_AFTER_MAX_S = 900UL;
+
+// Consecutive failed attempts of the SAME step before the sequence is abandoned.
+// With the curve above this is ~16 minutes: long enough to ride out a real outage,
+// short enough to never leave the command poll parked behind a dead sequence.
+constexpr uint16_t TELEGRAM_MAX_STEP_ATTEMPTS = 20;
+
+// Safety net for the command poll: a phase that has not moved for this long stops
+// blocking getUpdates(). With the retry/abort rules above a phase never stays put
+// this long, so this only covers a case nobody predicted.
+constexpr uint32_t TELEGRAM_PHASE_STUCK_MS = 120000UL;
+
+// -----------------------------------------------------------------------------
 // Time source / NTP
 // -----------------------------------------------------------------------------
 
