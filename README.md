@@ -120,20 +120,34 @@ um snapshot obrigatorio dos quatro estados para o ThingsBoard.
   stickers; a proxima FALTA apaga ambos. Textos nunca sao apagados.
 - Fases persistidas (DEL_OLD/SEND_FALL/TEXT_FALL/SEND_RET/TEXT_RET) permitem retomar apos
   reboot. Os indices de adjetivo/verbo sao escolhidos uma vez por ciclo.
+- **Exclusao impossivel**: a Bot API recusa apagar uma mensagem com mais de **48 h** e, para um
+  bot que nao seja administrador com `can_delete_messages`, qualquer mensagem que ele nao tenha
+  enviado (`400 message can't be deleted` / `403`). Isso e **permanente**: o id e descartado,
+  registrado no Serial (`deleteMessage impossivel ...` / `... descartado sem apagar ...`) e a
+  sequencia continua. O sticker antigo permanece no grupo; promover o bot a administrador
+  restabelece a substituicao normal.
+- **Politica de repeticao**: uma etapa que falha e repetida com backoff (3, 6, 12, 24, 48, 60 s),
+  respeitando o `retry_after` de um `429`; apos `TELEGRAM_MAX_STEP_ATTEMPTS` falhas da mesma
+  etapa a sequencia e abandonada e o estado volta a `tgPhase = NONE`. Erros sem recuperacao
+  (401 token, 403 sem direito, 400 `chat not found`, sticker invalido, 409 webhook) abandonam
+  imediatamente, sem laco de requisicoes.
 - As listas de adjetivos/verbos do rascunho foram preservadas sem alteracao.
 - **Estado visual (4 LEDs)**: existe sempre no maximo **uma** mensagem. Ao enviar a nova
   linha, o novo `message_id` e o anterior (guardado como `visualDeletePendingId`) sao
-  persistidos ANTES de apagar o anterior. Se a exclusao falhar, o id fica pendente e nenhuma
-  nova linha e enviada ate a exclusao ser confirmada (as mudancas continuam sendo coalescidas
-  no estado atual); so apos resolver a pendencia a linha atual e enviada. O texto de boot e a
-  linha de boot permanecem inalterados.
+  persistidos ANTES de apagar o anterior. Se a exclusao falhar de forma transitoria, o id fica
+  pendente e nenhuma nova linha e enviada ate a exclusao ser confirmada (as mudancas continuam
+  sendo coalescidas no estado atual); se a API recusar para sempre, o id e descartado e a linha
+  atual e enviada. O texto de boot e a linha de boot permanecem inalterados.
 - **Mensagem de reinicio**: existe sempre no maximo **uma**. Mesmo esquema (Model B) da linha
   visual: o novo `message_id` e o anterior (`bootDeletePendingId`) sao persistidos ANTES de
   apagar o anterior; enquanto uma exclusao estiver pendente nenhuma nova mensagem de reinicio e
   criada. A exclusao so conta como confirmada quando a API responde `{"ok":true,"result":true}`
   (nao basta um HTTP 200: `{"ok":false,...}` e falha). O conteudo da mensagem de boot permanece
   inalterado (o motivo aparece em portugues). Independente de FALTA/RETORNO e da linha visual.
-- Comandos: `/reboot` e `/ota` (autorizados por `TELEGRAM_CHAT_ID`).
+- Comandos: `/reboot` e `/ota` (autorizados por `TELEGRAM_CHAT_ID`). O `getUpdates()` espera a
+  sequencia de notificacao terminar, mas **nunca** fica preso: uma fase sem progresso por
+  `TELEGRAM_PHASE_STUCK_MS` (120 s) libera o poll (`DIAG ... tgStuck=1`) e os comandos voltam a
+  responder.
 
 ## Secrets
 

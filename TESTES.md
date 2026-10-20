@@ -4,7 +4,8 @@ Observaveis pelo Serial (linha `DIAG ...` a cada 60 s e mensagens de boot/transi
 pelo ThingsBoard (telemetria/atributos) e pelo Telegram.
 
 Campos do `DIAG`: `up` (uptime s), `wifi`, `rssi`, `ntp`, `rede`, `pend` (n pendentes TB),
-`head`, `gap` (tbGapCount), `tgPend`, `tgNotif`, `tgForce`, `tgPhase`, `fallId`, `retId`,
+`head`, `gap` (tbGapCount), `tgPend`, `tgNotif`, `tgForce`, `tgPhase`, `tgStuck` (fase sem
+progresso ha mais de `TELEGRAM_PHASE_STUCK_MS`), `fallId`, `retId`,
 `visId` (id da atual mensagem visual), `visDelId` (id aguardando exclusao, 0 = nenhum).
 Na linha `BOOT DIAG` adicional: `bootId` (id da atual mensagem de reinicio), `bootDelId` (id de
 reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da mensagem).
@@ -137,10 +138,12 @@ reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da
 
 ### Teste 4 - Falha no delete dos stickers
 
-1. Forcar falha de `deleteMessage()` (ex.: derrubar a rede durante `DEL_OLD`).
+1. Forcar uma falha **transitoria** de `deleteMessage()` (ex.: derrubar a rede durante `DEL_OLD`).
 2. Confirmar: `fallId`/`retId` continuam persistidos; `tgPhase` continua `del_old`;
-   nao avanca para `send_fall`; o retry ocorre na proxima tentativa.
+   nao avanca para `send_fall`; o retry ocorre depois do backoff (`TG: retry fase=del_old ...`).
 3. Restaurar a rede e confirmar: o ID e zerado e a fase avanca para `send_fall`.
+4. Uma recusa **permanente** (`400 message can't be deleted` / `403`) e o caso do teste S1:
+   o id e descartado e a sequencia continua.
 
 ### Teste 5 - Falha de montagem da LittleFS
 
@@ -231,6 +234,63 @@ reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da
 3. `deleteMessage()` da linha recusado: `visDelId` persistido; nenhuma linha nova enquanto
    pendente; ao restaurar, a exclusao e confirmada e so entao a linha atual e enviada.
 4. Uma mudanca dos 4 sinais gera nova linha e apaga a anterior (sem `AVISO: falha ao gravar state.bin`).
+
+## Rodada - Telegram nao bloqueia mais os comandos
+
+Contexto: a notificacao parou **e** o bot deixou de responder aos comandos, com o ThingsBoard
+normal. Causa: `DEL_OLD` tentava apagar um sticker que a API recusa apagar para sempre —
+`400 message can't be deleted` quando a mensagem tem mais de 48 h, `403` quando o bot nao e
+administrador com o direito de apagar. Isso era tratado como falha transitoria, a fase ficava
+persistida e `handleTelegramCommands()` deixava de chamar `getUpdates()`.
+
+### Teste S1 - Exclusao impossivel (bot nao-admin ou mensagem com mais de 48 h)
+
+1. Com o bot apenas **membro** do grupo (sem `can_delete_messages`), gere FALTA e depois RETORNO.
+2. Na FALTA seguinte, o `DEL_OLD` tenta apagar stickers que a API recusa.
+3. Esperado no Serial: `deleteMessage impossivel error_code=...` seguido de
+   `DEL_FALL resultado=IMPOSSIVEL` / `DEL_RET resultado=IMPOSSIVEL` e
+   `... descartado sem apagar (exclusao impossivel)`.
+4. Esperado: o id e zerado, `tgPhase` avanca (`del_old` -> `send_fall` -> `text_fall`), a nova
+   FALTA e enviada (`SEND_FALL OK`, `TEXT_FALL OK`) e `DIAG ... tgPhase=none`.
+5. O sticker antigo **permanece** no grupo (a API nao permite apaga-lo); o firmware nao pode
+   travar por isso. Promover o bot a administrador restabelece a substituicao normal.
+
+### Teste S2 - Telegram inacessivel no boot
+
+1. Bloqueie o acesso ao Telegram e reinicie o ESP.
+2. Esperado: `aviso de boot` e a linha visual falham e sao repetidos com backoff
+   (`TG: retry aviso de boot em=3000ms tentativa=1`, depois `6000`, `12000`, `24000`, `48000`,
+   `60000`), sem uma requisicao por passagem do loop.
+3. Restaure o acesso: os envios terminam sem mensagens duplicadas.
+4. Envie `/reboot`: o comando responde e o `update_id` avanca (o comando nao se repete).
+
+### Teste S3 - `/reboot` com fase travada (rede de seguranca)
+
+1. Forcar `tgPhase = TG_PHASE_DEL_OLD` em `state.bin` com `tgPending` verdadeiro e o Telegram
+   inacessivel.
+2. Esperado: nenhum `getUpdates()` enquanto a fase progride; apos `TELEGRAM_PHASE_STUCK_MS`
+   (120 s) o Serial registra `TG: fase del_old sem progresso ha ...ms; comandos liberados` e o
+   `DIAG` mostra `tgStuck=1`.
+3. Nesse estado `/reboot` responde e reinicia.
+4. Restaurando a rede antes dos 120 s, a sequencia termina normalmente e `tgStuck` volta a 0.
+
+### Teste S4 - Orcamento de tentativas
+
+1. Mantenha o Telegram inacessivel e provoque uma FALTA.
+2. Esperado: as tentativas sao espacadas (3, 6, 12, 24, 48, 60 s...) e, apos
+   `TELEGRAM_MAX_STEP_ATTEMPTS` (20) falhas, o Serial registra
+   `TG: sequencia ABORTADA motivo=tentativas esgotadas ...` com `tgPending=0` e `tgPhase=none`.
+3. Ao voltar a rede, o RETORNO seguinte e enviado normalmente (nada fica preso).
+
+### Teste S5 - Erro fatal (token invalido ou chat errado)
+
+1. Use temporariamente um `TELEGRAM_BOT_TOKEN` invalido (ou um `TELEGRAM_CHAT_ID` de um chat do
+   qual o bot nao participa).
+2. Esperado: `api_ok=0 error_code=401` (ou `400 ... chat not found`) seguido de
+   `sequencia ABORTADA motivo=erro fatal da API` e, no boot,
+   `aviso de boot abandonado neste boot (error_code=...)`.
+3. Sem rajada de requisicoes: no maximo uma tentativa por transicao, nenhuma em laco.
+4. Restauradas as credenciais, a proxima transicao volta a notificar.
 
 ## Rodada de diagnostico - heap antes do Telegram
 
