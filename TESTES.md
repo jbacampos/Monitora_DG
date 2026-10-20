@@ -211,7 +211,8 @@ reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da
    `bootDelId` volta a 0. No Telegram existe **uma** mensagem de reinicio.
 3. Envio da nova mensagem falha (rede cai durante o `sendMessage`): a mensagem anterior
    **nao** e apagada; `bootId`/`bootDelId` inalterados; o envio e repetido depois.
-4. Envio OK mas `deleteMessage()` recusado (`{"ok":false,...}`): no Serial
+4. Envio OK mas `deleteMessage()` recusado de forma **transitoria** (`{"ok":false,...}` com
+   erro que nao seja 48 h/sem direito): no Serial
    `deleteMessage resposta ok=0 error_code=...`; persistir `bootDelId`; **nenhuma** nova mensagem
    de reinicio e criada enquanto pendente.
 5. `deleteMessage` respondendo `message to delete not found`: no Serial
@@ -231,8 +232,9 @@ reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da
 
 1. Boot: apos o texto de boot e enviada a linha visual; `visId` != 0; `visDelId` = 0.
 2. Boot seguinte: nova linha; a anterior apagada (`visDelId` volta a 0). Existe **uma** linha.
-3. `deleteMessage()` da linha recusado: `visDelId` persistido; nenhuma linha nova enquanto
-   pendente; ao restaurar, a exclusao e confirmada e so entao a linha atual e enviada.
+3. `deleteMessage()` da linha recusado de forma **transitoria**: `visDelId` persistido; nenhuma
+   linha nova enquanto pendente; ao restaurar, a exclusao e confirmada e so entao a linha atual e
+   enviada. (Recusa permanente — 48 h/sem direito: ver teste S1, o id e descartado.)
 4. Uma mudanca dos 4 sinais gera nova linha e apaga a anterior (sem `AVISO: falha ao gravar state.bin`).
 
 ## Rodada - Telegram nao bloqueia mais os comandos
