@@ -477,6 +477,27 @@ namespace {
       return String(line);
    }
 
+   // Resolves a persisted message id awaiting deletion. Returns true when the id no longer
+   // blocks the caller, which must then clear it and persist: Telegram confirmed the deletion,
+   // the message was already gone, or Telegram refused it permanently (message older than
+   // 48 h / bot without can_delete_messages). false means a transient failure: keep the id and
+   // retry later. Blocking on a permanent refusal used to wedge the whole Telegram path, since
+   // the same guard also left getUpdates() (hence /reboot and /ota) unserviced.
+   bool resolvePendingDelete(int32_t &pendingId, const char *label) {
+      const Telegram::DeleteResult result = telegram.deleteMessage(pendingId);
+
+      if (result == Telegram::DeleteResult::Failed) {
+         return false;
+      }
+
+      if (result == Telegram::DeleteResult::Impossible) {
+         Serial.printf("[%lu] TG: %s: exclusao impossivel (mais de 48h ou bot sem direito) id=%ld; id descartado\n",
+                       static_cast<unsigned long>(millis()), label, static_cast<long>(pendingId));
+      }
+
+      return true;
+   }
+
    // Sends the visual line once per boot (right after the boot text) and whenever a change
    // of the four signals has been settled. A provisional redeDisponivel fall - one that is
    // still inside the grace window - is never represented by a change driven line: it waits
@@ -503,7 +524,7 @@ namespace {
       // the pending deletion is retried first. The current state stays pending
       // (visualPending) and coalesced, and is sent once the deletion is resolved.
       if (persisted.visualDeletePendingId != 0) {
-         if (telegram.deleteMessage(persisted.visualDeletePendingId)) {
+         if (resolvePendingDelete(persisted.visualDeletePendingId, "LEDs antigos")) {
             persisted.visualDeletePendingId = 0;
             saveState();
 
@@ -560,7 +581,7 @@ namespace {
          // Replace the previous visual message. If the deletion fails, the id stays
          // persisted and the next pass retries it (blocking any new line until then).
          if (persisted.visualDeletePendingId != 0) {
-            if (telegram.deleteMessage(persisted.visualDeletePendingId)) {
+            if (resolvePendingDelete(persisted.visualDeletePendingId, "LEDs antigos")) {
                persisted.visualDeletePendingId = 0;
                saveState();
 
@@ -592,7 +613,7 @@ namespace {
       // this boot's notice was sent. While it is pending no new notice is created (a new one
       // would only pile up more pending deletions).
       if (persisted.bootDeletePendingId != 0) {
-         if (telegram.deleteMessage(persisted.bootDeletePendingId)) {
+         if (resolvePendingDelete(persisted.bootDeletePendingId, "notificacao de boot anterior")) {
             persisted.bootDeletePendingId = 0;
             saveState();
 
@@ -640,7 +661,7 @@ namespace {
          // Replace the previous reboot notice. If the deletion fails, its id stays persisted
          // and the next pass retries it (blocking any new notice until then).
          if (persisted.bootDeletePendingId != 0) {
-            if (telegram.deleteMessage(persisted.bootDeletePendingId)) {
+            if (resolvePendingDelete(persisted.bootDeletePendingId, "notificacao de boot anterior")) {
                persisted.bootDeletePendingId = 0;
                saveState();
 

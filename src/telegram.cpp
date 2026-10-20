@@ -398,6 +398,27 @@ namespace {
       Serial.printf("[%lu] TG HTTP: %s transporte=OK http=%d api_ok=0 error_code=%d description=\"%s\" duracao=%lums\n", static_cast<unsigned long>(millis()), method,
                     http, errCode, desc.substring(0, TG_DIAG_DESC_MAX).c_str(), static_cast<unsigned long>(dur));
    }
+
+   // A deletion Telegram will never accept, no matter how many times it is retried.
+   //
+   // The Bot API refuses to delete a message older than 48 hours and, for a bot that is not
+   // an administrator with can_delete_messages, any message it did not send itself. Both
+   // answers (400 "message can't be deleted", 403 "not enough rights") are permanent for
+   // that message id, so the id has to be dropped instead of blocking the sequence.
+   bool deleteRefusedForever(int errorCode, const String &description) {
+      if (errorCode == 403) {
+         return true; // not enough rights / bot is not a member of the chat
+      }
+
+      if (errorCode != 400) {
+         return false; // 429, 5xx and transport problems are transient
+      }
+
+      return description.indexOf("message can't be deleted") >= 0 ||
+             description.indexOf("message cannot be deleted") >= 0 ||
+             description.indexOf("not enough rights") >= 0 ||
+             description.indexOf("message_id_invalid") >= 0;
+   }
 } // namespace
 
 bool Telegram::begin(int32_t restoredUpdateOffset) {
@@ -709,11 +730,12 @@ bool Telegram::sendSticker(const String &stickerId, int32_t &messageId) {
    return messageId > 0;
 }
 
-bool Telegram::deleteMessage(int32_t messageId) {
+Telegram::DeleteResult Telegram::deleteMessage(int32_t messageId) {
    if (messageId <= 0) {
-      // Diagnostic-only: the id handed to the API was not usable.
+      // Diagnostic-only: the id handed to the API was not usable. Retrying an unusable id
+      // can never succeed, so it is reported as permanent (the caller drops it).
       Serial.printf("[%lu] TG: deleteMessage id_invalido=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
-      return false;
+      return DeleteResult::Impossible;
    }
 
    String response;
@@ -729,7 +751,7 @@ bool Telegram::deleteMessage(int32_t messageId) {
    if (!request("deleteMessage", query, response)) {
       // The transport failure was already logged by request().
       Serial.printf("[%lu] TG: deleteMessage transporte_falhou id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
-      return false;
+      return DeleteResult::Failed;
    }
 
    DynamicJsonDocument doc(1024);
@@ -738,7 +760,7 @@ bool Telegram::deleteMessage(int32_t messageId) {
       // Diagnostic-only: the reply body was not parseable JSON.
       Serial.printf("[%lu] TG: deleteMessage json_nao_parseavel id=%ld body=\"%s\"\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId),
                     diagBody(response).c_str());
-      return false;
+      return DeleteResult::Failed;
    }
 
    const bool apiOk = doc["ok"] | false;
@@ -761,22 +783,30 @@ bool Telegram::deleteMessage(int32_t messageId) {
                        static_cast<long>(messageId));
       }
 
-      return deleted;
+      return deleted ? DeleteResult::Deleted : DeleteResult::Failed;
    }
 
    // Telegram answers this specific error when the target message no longer exists: the
    // deletion is already satisfied, so it counts as a logical success and
    // TelegramNotifier::stepDelOld() clears the stored id and advances phase exactly as after
-   // a confirmed deletion. Every other outcome (other API error, other HTTP status, transport
-   // failure) keeps the current retry behaviour.
+   // a confirmed deletion.
    if (errorCode == 400 && description.indexOf("message to delete not found") >= 0) {
       // Logged distinctly: hitting this repeatedly means the stored id does not match a live
       // message, which must be investigated (it is NOT a normal success path).
       Serial.printf("[%lu] TG: deleteMessage ja_inexistente id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
-      return true;
+      return DeleteResult::NotFound;
    }
 
-   return false;
+   // The message is older than 48 h, or the bot has no right to delete it. No retry can
+   // change that: the caller drops the id and the sequence continues. The old bubble stays
+   // in the chat (logged here so the cause is never silent).
+   if (deleteRefusedForever(errorCode, description)) {
+      Serial.printf("[%lu] TG: deleteMessage impossivel error_code=%d id=%ld description=\"%s\" (idade > 48h ou bot sem direito de apagar)\n",
+                    static_cast<unsigned long>(millis()), errorCode, static_cast<long>(messageId), description.c_str());
+      return DeleteResult::Impossible;
+   }
+
+   return DeleteResult::Failed;
 }
 
 void Telegram::processUpdates(const String &response) {

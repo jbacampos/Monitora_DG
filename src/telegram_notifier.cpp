@@ -234,52 +234,69 @@ void TelegramNotifier::finishSequence(bool deliveredValue) {
 }
 
 void TelegramNotifier::stepDelOld() {
-   // Only clear an id once Telegram confirmed the deletion; otherwise keep the
-   // id, stay in DEL_OLD and retry later.
-   if (state_->lastFallStickerId > 0) {
-      const int32_t id = state_->lastFallStickerId;
-      const uint32_t tDel = millis();
-
-      Serial.printf("[%lu] TG: DEL_FALL inicio id=%ld\n", static_cast<unsigned long>(tDel), static_cast<long>(id));
-
-      const bool ok = telegram_->deleteMessage(id);
-
-      Serial.printf("[%lu] TG: DEL_FALL resultado=%s id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA", static_cast<long>(id),
-                    static_cast<unsigned long>(millis() - tDel));
-
-      if (!ok) {
-         return;
-      }
-
-      state_->lastFallStickerId = 0;
-      save();
-   } else {
-      Serial.printf("[%lu] TG: DEL_FALL skip id=0\n", static_cast<unsigned long>(millis()));
+   // Only clear an id once the deletion was resolved: Telegram confirmed it, the message was
+   // already gone, or Telegram refused it permanently (message older than 48 h / bot without
+   // can_delete_messages). An outright refusal used to keep the sequence parked in DEL_OLD
+   // forever - and with it the getUpdates() poll, so /reboot and /ota went dead while
+   // ThingsBoard kept working. A transient failure still keeps the id and the phase.
+   if (!resolveStickerDelete(state_->lastFallStickerId, "DEL_FALL")) {
+      return;
    }
 
-   if (state_->lastReturnStickerId > 0) {
-      const int32_t id = state_->lastReturnStickerId;
-      const uint32_t tDel = millis();
-
-      Serial.printf("[%lu] TG: DEL_RET inicio id=%ld\n", static_cast<unsigned long>(tDel), static_cast<long>(id));
-
-      const bool ok = telegram_->deleteMessage(id);
-
-      Serial.printf("[%lu] TG: DEL_RET resultado=%s id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA", static_cast<long>(id),
-                    static_cast<unsigned long>(millis() - tDel));
-
-      if (!ok) {
-         return;
-      }
-
-      state_->lastReturnStickerId = 0;
-      save();
-   } else {
-      Serial.printf("[%lu] TG: DEL_RET skip id=0\n", static_cast<unsigned long>(millis()));
+   if (!resolveStickerDelete(state_->lastReturnStickerId, "DEL_RET")) {
+      return;
    }
 
    state_->tgPhase = TG_PHASE_SEND_FALL;
    save();
+}
+
+bool TelegramNotifier::resolveStickerDelete(int32_t &id, const char *label) {
+   if (id <= 0) {
+      Serial.printf("[%lu] TG: %s skip id=0\n", static_cast<unsigned long>(millis()), label);
+      return true;
+   }
+
+   const int32_t target = id;
+   const uint32_t tDel = millis();
+
+   Serial.printf("[%lu] TG: %s inicio id=%ld\n", static_cast<unsigned long>(millis()), label, static_cast<long>(target));
+
+   const Telegram::DeleteResult result = telegram_->deleteMessage(target);
+
+   const char *verdict = "FALHA";
+
+   switch (result) {
+      case Telegram::DeleteResult::Deleted:
+         verdict = "OK";
+         break;
+      case Telegram::DeleteResult::NotFound:
+         verdict = "JA_INEXISTENTE";
+         break;
+      case Telegram::DeleteResult::Impossible:
+         verdict = "IMPOSSIVEL";
+         break;
+      case Telegram::DeleteResult::Failed:
+         break;
+   }
+
+   Serial.printf("[%lu] TG: %s resultado=%s id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), label, verdict, static_cast<long>(target),
+                 static_cast<unsigned long>(millis() - tDel));
+
+   if (result == Telegram::DeleteResult::Failed) {
+      return false; // keep the id persisted and stay in the phase; retried later
+   }
+
+   if (result == Telegram::DeleteResult::Impossible) {
+      // The old sticker stays in the chat (Telegram will never delete it), but the sequence
+      // must go on: blocking here also blocked the command poll.
+      Serial.printf("[%lu] TG: %s descartado sem apagar (exclusao impossivel) id=%ld\n", static_cast<unsigned long>(millis()), label,
+                    static_cast<long>(target));
+   }
+
+   id = 0;
+   save();
+   return true;
 }
 
 void TelegramNotifier::stepSendFall() {

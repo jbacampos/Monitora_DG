@@ -4,6 +4,18 @@
 
 class Telegram {
 public:
+   // Verdict of deleteMessage(). The caller MUST tell "the message is gone" apart from
+   // "Telegram refuses to delete it", because the second one is permanent (message older
+   // than 48 h, or a bot without the can_delete_messages right) and retrying can never
+   // succeed. Treating it as a transient failure used to block DEL_OLD forever, which also
+   // blocked the getUpdates() poll and therefore every command (/reboot, /ota).
+   enum class DeleteResult : uint8_t {
+      Deleted,    // {"ok":true,"result":true}
+      NotFound,   // "message to delete not found": the deletion is already satisfied
+      Impossible, // Telegram refuses permanently (age/rights): drop the id and go on
+      Failed      // transient (transport, 5xx, 429, unconfirmed reply): retry later
+   };
+
    // restoredUpdateOffset is the persisted update_id + 1 (0 when nothing is known yet).
    // It is restored so an update already processed before a reboot is not executed again.
    bool begin(int32_t restoredUpdateOffset = 0);
@@ -20,7 +32,11 @@ public:
    // set to 0 when the reply carried no id.
    bool sendText(const String &message, int32_t &messageId);
    bool sendSticker(const String &stickerId, int32_t &messageId);
-   bool deleteMessage(int32_t messageId);
+
+   // Returns Deleted/NotFound when the id no longer refers to a live message,
+   // Impossible when Telegram will never accept the deletion and Failed when the
+   // deletion may still succeed on a later attempt.
+   DeleteResult deleteMessage(int32_t messageId);
 
    bool commandRebootRequested();
    bool commandOtaRequested();

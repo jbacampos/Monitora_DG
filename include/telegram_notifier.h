@@ -50,6 +50,9 @@ private:
    void finishSequence(bool deliveredValue);
 
    void stepDelOld();
+   // Resolves one persisted sticker id: true when it no longer blocks (deleted, already
+   // gone or permanently refused); false only for a transient failure.
+   bool resolveStickerDelete(int32_t &id, const char *label);
    void stepSendFall();
    void stepTextFall();
    void stepSendRet();
