@@ -411,12 +411,44 @@ namespace {
       }
    }
 
+   // RAM only: the Telegram phase being watched and the instant it was first seen, used by
+   // handleTelegramCommands() to keep a wedged phase from blocking getUpdates() forever.
+   uint8_t tgWatchedPhase = TG_PHASE_NONE;
+   uint32_t tgWatchedSince = 0;
+   bool tgStuckReported = false;
+   bool tgPhaseStuck = false; // diagnostic mirror of the last evaluation (DIAG line)
+
+   // Diagnostic-only: defined below, used by the command gate.
+   const char *phaseName(uint8_t phase);
+
    void handleTelegramCommands(uint32_t now) {
       // While a notification sequence is in flight (tgPending with an active
       // phase), its phases must run back to back: polling getUpdates() here would
       // insert a full HTTPS round-trip between every step. Commands are still
       // processed normally as soon as the sequence has finished (phase == NONE).
-      const bool notifying = persisted.tgPending && persisted.tgPhase != TG_PHASE_NONE;
+      //
+      // A phase that does not move for TELEGRAM_PHASE_STUCK_MS stops blocking the poll. The
+      // retry/abort rules keep this from happening, and if it ever does the commands must win:
+      // a wedged phase used to make /reboot and /ota unreachable while ThingsBoard kept working.
+      if (persisted.tgPhase != tgWatchedPhase) {
+         tgWatchedPhase = persisted.tgPhase;
+         tgWatchedSince = now;
+         tgStuckReported = false;
+      }
+
+      const bool activePhase = (persisted.tgPhase != TG_PHASE_NONE);
+      const uint32_t phaseAge = static_cast<uint32_t>(now - tgWatchedSince);
+      const bool stuck = activePhase && phaseAge >= TELEGRAM_PHASE_STUCK_MS;
+
+      tgPhaseStuck = stuck;
+
+      if (stuck && !tgStuckReported) {
+         tgStuckReported = true;
+         Serial.printf("[%lu] TG: fase %s sem progresso ha %lums; comandos liberados\n", static_cast<unsigned long>(now), phaseName(persisted.tgPhase),
+                       static_cast<unsigned long>(phaseAge));
+      }
+
+      const bool notifying = persisted.tgPending && activePhase && !stuck;
 
       if (!notifying) {
          telegram.update(now);
@@ -859,11 +891,12 @@ namespace {
                     static_cast<unsigned long>(telegram.reuseAttempts()), static_cast<unsigned long>(telegram.reuseSuccess()),
                     static_cast<unsigned long>(telegram.reuseStalls()), static_cast<unsigned long>(telegram.newConnections()));
 
-      Serial.printf("DIAG up=%lus wifi=%d rssi=%d ntp=%d rede=%d pend=%lu head=%lu gap=%u tgPend=%d tgNotif=%d tgForce=%d tgPhase=%s fallId=%ld retId=%ld visId=%ld visDelId=%ld\n",
+      Serial.printf("DIAG up=%lus wifi=%d rssi=%d ntp=%d rede=%d pend=%lu head=%lu gap=%u tgPend=%d tgNotif=%d tgForce=%d tgPhase=%s tgStuck=%d "
+                    "fallId=%ld retId=%ld visId=%ld visDelId=%ld\n",
                     static_cast<unsigned long>(now / 1000UL), WiFi.status() == WL_CONNECTED ? 1 : 0, WiFi.RSSI(), timeSource.synced() ? 1 : 0,
                     persisted.power.redeDisponivel ? 1 : 0, static_cast<unsigned long>(count - persisted.tbLogHead),
                     static_cast<unsigned long>(persisted.tbLogHead), persisted.tbGapCount, persisted.tgPending ? 1 : 0, persisted.tgNotifiedRede ? 1 : 0,
-                    persisted.tgForceNotify ? 1 : 0, phaseName(persisted.tgPhase), static_cast<long>(persisted.lastFallStickerId),
+                    persisted.tgForceNotify ? 1 : 0, phaseName(persisted.tgPhase), tgPhaseStuck ? 1 : 0, static_cast<long>(persisted.lastFallStickerId),
                     static_cast<long>(persisted.lastReturnStickerId), static_cast<long>(persisted.lastVisualMessageId),
                     static_cast<long>(persisted.visualDeletePendingId));
 
