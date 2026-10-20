@@ -163,6 +163,8 @@ void TelegramNotifier::update() {
       seqStartMillis_ = millis();
    }
 
+   const uint8_t phaseBefore = state_->tgPhase;
+
    switch (state_->tgPhase) {
       case TG_PHASE_NONE:
          startSequence();
@@ -185,6 +187,14 @@ void TelegramNotifier::update() {
       default:
          state_->tgPhase = TG_PHASE_NONE;
          break;
+   }
+
+   // A step that did not move the sequence forward failed. If Telegram refused it with an
+   // error that no retry can change (bad token, chat not found, no rights to send, invalid
+   // sticker), the sequence is abandoned instead of being retried forever: the persisted
+   // phase would never be released and the command poll waits for it.
+   if (state_->tgPhase == phaseBefore && telegram_->lastErrorFatal()) {
+      abortSequence("erro fatal da API");
    }
 }
 
@@ -231,6 +241,25 @@ void TelegramNotifier::finishSequence(bool deliveredValue) {
 
    Serial.printf("[%lu] TG: %s total=%lums\n", static_cast<unsigned long>(tDone), deliveredValue ? "RETORNO concluido" : "FALTA concluida",
                  static_cast<unsigned long>(total));
+}
+
+void TelegramNotifier::abortSequence(const char *reason) {
+   const uint32_t tDone = millis();
+   const uint32_t total = static_cast<uint32_t>(tDone - seqStartMillis_);
+
+   Serial.printf("[%lu] TG: sequencia ABORTADA motivo=%s fase=%s error_code=%d fatal=%s total=%lums\n", static_cast<unsigned long>(tDone), reason,
+                 tgPhaseName(state_->tgPhase), telegram_->lastErrorCode(), telegram_->lastErrorFatal() ? "sim" : "nao",
+                 static_cast<unsigned long>(total));
+
+   // The current direction is marked as handled so the loop does not immediately restart the
+   // same doomed sequence (a returnPending or a coalesced pending would re-arm it forever).
+   // Nothing is claimed as delivered: Telegram reflects it on the next real transition.
+   state_->tgNotifiedRede = state_->power.redeDisponivel;
+   state_->tgPhase = TG_PHASE_NONE;
+   state_->tgForceNotify = false;
+   state_->tgPending = false;
+
+   save();
 }
 
 void TelegramNotifier::stepDelOld() {

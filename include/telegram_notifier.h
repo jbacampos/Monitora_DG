@@ -48,6 +48,9 @@ private:
    void startSequence();
    void pickIndices(bool returnOfEnergy);
    void finishSequence(bool deliveredValue);
+   // Gives up on the current sequence after an error no retry can fix, leaving the state
+   // consistent (phase NONE, nothing pending) so the loop and the command poll resume.
+   void abortSequence(const char *reason);
 
    void stepDelOld();
    // Resolves one persisted sticker id: true when it no longer blocks (deleted, already

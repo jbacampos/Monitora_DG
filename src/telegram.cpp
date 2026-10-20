@@ -419,6 +419,29 @@ namespace {
              description.indexOf("not enough rights") >= 0 ||
              description.indexOf("message_id_invalid") >= 0;
    }
+
+   // Errors that can never succeed by retrying: a wrong token, a chat the bot cannot write to,
+   // an invalid/foreign sticker id, a webhook conflicting with getUpdates(). Transport
+   // failures and 429/5xx are NOT here: those are transient by definition.
+   bool apiErrorIsFatal(int errorCode, const String &description) {
+      if (errorCode == 401 || errorCode == 409) { // bad token / webhook set on the bot
+         return true;
+      }
+
+      if (errorCode == 403) { // kicked, blocked or not enough rights to send
+         return true;
+      }
+
+      if (errorCode != 400) {
+         return false;
+      }
+
+      return description.indexOf("chat not found") >= 0 ||
+             description.indexOf("wrong file identifier") >= 0 ||
+             description.indexOf("message text is empty") >= 0 ||
+             description.indexOf("message is too long") >= 0 ||
+             description.indexOf("chat_id is empty") >= 0;
+   }
 } // namespace
 
 bool Telegram::begin(int32_t restoredUpdateOffset) {
@@ -454,6 +477,24 @@ uint32_t Telegram::newConnections() const {
    return tgNewConnections;
 }
 
+int Telegram::lastErrorCode() const {
+   return lastErrorCode_;
+}
+
+bool Telegram::lastErrorFatal() const {
+   return lastErrorFatal_;
+}
+
+uint16_t Telegram::lastRetryAfterSeconds() const {
+   return lastRetryAfterSeconds_;
+}
+
+void Telegram::noteApiResult(int errorCode, const String &description, uint16_t retryAfterSeconds) {
+   lastErrorCode_ = errorCode;
+   lastErrorFatal_ = (errorCode != 0) && apiErrorIsFatal(errorCode, description);
+   lastRetryAfterSeconds_ = retryAfterSeconds;
+}
+
 String Telegram::urlEncode(const String &value) {
    String encoded;
    encoded.reserve(value.length() * 3);
@@ -485,6 +526,12 @@ bool Telegram::request(
    bool allowReuse) {
 
    const uint32_t httpStart = millis();
+
+   // Per-request verdict: reset before anything is sent, so a call that never reaches the API
+   // is never mistaken for a permanent failure (transport problems stay transient).
+   lastErrorCode_ = 0;
+   lastErrorFatal_ = false;
+   lastRetryAfterSeconds_ = 0;
 
    Serial.printf("[%lu] TG HTTP: %s inicio\n", static_cast<unsigned long>(httpStart), method.c_str());
 
@@ -682,6 +729,7 @@ bool Telegram::sendMessageInternal(const String &message, int32_t *outId) {
    }
 
    if (!(doc["ok"] | false)) {
+      noteApiResult(doc["error_code"] | 0, doc["description"] | "", doc["parameters"]["retry_after"] | 0);
       return false;
    }
 
@@ -717,6 +765,7 @@ bool Telegram::sendSticker(const String &stickerId, int32_t &messageId) {
    }
 
    if (!(doc["ok"] | false)) {
+      noteApiResult(doc["error_code"] | 0, doc["description"] | "", doc["parameters"]["retry_after"] | 0);
       return false;
    }
 
@@ -771,6 +820,8 @@ Telegram::DeleteResult Telegram::deleteMessage(int32_t messageId) {
    Serial.printf("[%lu] TG: deleteMessage resposta ok=%d error_code=%d description=\"%s\" id=%ld\n", static_cast<unsigned long>(millis()), apiOk ? 1 : 0,
                  errorCode, description.c_str(), static_cast<long>(messageId));
 
+   noteApiResult(errorCode, description, doc["parameters"]["retry_after"] | 0);
+
    if (apiOk) {
       // Telegram answers {"ok":true,"result":true} for a real deletion. Requiring the boolean
       // result rejects a foreign/replayed body that merely carries "ok":true (for example a
@@ -823,6 +874,9 @@ void Telegram::processUpdates(const String &response) {
    }
 
    if (!(doc["ok"] | false)) {
+      // A getUpdates() refused by the API (bad token, webhook set) is surfaced the same way,
+      // so the caller of the poll can tell it apart from a transport problem.
+      noteApiResult(doc["error_code"] | 0, doc["description"] | "", doc["parameters"]["retry_after"] | 0);
       return;
    }
 

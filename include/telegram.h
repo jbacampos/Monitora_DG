@@ -51,6 +51,16 @@ public:
    uint32_t reuseStalls() const;
    uint32_t newConnections() const;
 
+   // Verdict of the LAST API reply parsed by this class. lastErrorCode() is 0 when the
+   // previous call failed before any API reply (a transport problem, transient by
+   // definition). lastErrorFatal() is true only for the errors that can never succeed by
+   // retrying (401 bad token, 403 no rights/kicked, 400 chat not found or invalid sticker id,
+   // 409 webhook conflict): the caller must abandon the operation instead of retrying it
+   // forever. lastRetryAfterSeconds() carries Telegram's retry_after on a 429.
+   int lastErrorCode() const;
+   bool lastErrorFatal() const;
+   uint16_t lastRetryAfterSeconds() const;
+
 private:
    uint32_t lastPoll_ = 0;
    int32_t updateOffset_ = 0;
@@ -58,6 +68,14 @@ private:
 
    bool rebootRequested_ = false;
    bool otaRequested_ = false;
+
+   int lastErrorCode_ = 0;
+   bool lastErrorFatal_ = false;
+   uint16_t lastRetryAfterSeconds_ = 0;
+
+   // Records the verdict of an API reply so the caller can tell a permanent failure from a
+   // transient one. Called by every method that parses the reply.
+   void noteApiResult(int errorCode, const String &description, uint16_t retryAfterSeconds);
 
    bool request(
       const String &method,

@@ -58,6 +58,10 @@ namespace {
    bool visualBootPending = false; // boot line: immediate, ignores the stability window
    uint32_t visualArmedMillis = 0;
    bool bootTextSent = false;
+   // RAM only: the API refused the boot notice with an error no retry can fix (bad token, chat
+   // not found, bot without rights). Nothing else is attempted this boot, so a dead bot cannot
+   // turn the loop into a permanent request storm; any later transition arms it again.
+   bool bootNoticeAbandoned = false;
    bool visualStateKnown = false;
    PowerState lastVisualState{};
 
@@ -512,6 +516,12 @@ namespace {
    // orphan bubbles never accumulate. Changes arriving meanwhile keep arming visualPending
    // and are coalesced into the current state.
    void serviceVisualNotice() {
+      // A boot notice permanently refused by the API means the bot cannot post at all: the LED
+      // line is not attempted either (it would only repeat the same doomed request).
+      if (bootNoticeAbandoned) {
+         return;
+      }
+
       if (!bootTextSent || WiFi.status() != WL_CONNECTED) {
          return;
       }
@@ -592,7 +602,15 @@ namespace {
             }
          }
       } else {
-         visualPending = true; // retry with the state detected then
+         if (telegram.lastErrorFatal()) {
+            // Same reasoning as the boot notice: a permanent refusal is not retried.
+            bootNoticeAbandoned = true;
+            visualPending = false;
+            Serial.printf("[%lu] TG: LEDs abandonados neste boot (error_code=%d sem recuperacao possivel)\n",
+                          static_cast<unsigned long>(millis()), telegram.lastErrorCode());
+         } else {
+            visualPending = true; // retry with the state detected then
+         }
       }
    }
 
@@ -671,6 +689,12 @@ namespace {
                              static_cast<long>(persisted.bootDeletePendingId));
             }
          }
+      } else if (telegram.lastErrorFatal()) {
+         // Nothing can be delivered this boot: no token/chat/rights. Not retried until the next
+         // transition, so the loop is not turned into a request storm.
+         bootNoticeAbandoned = true;
+         Serial.printf("[%lu] TG: aviso de boot abandonado neste boot (error_code=%d sem recuperacao possivel)\n",
+                       static_cast<unsigned long>(millis()), telegram.lastErrorCode());
       }
    }
 
@@ -887,6 +911,7 @@ void loop() {
             handleTransition(current, timeSource.now());
             visualArmedMillis = millis(); // every change restarts the stability window
             visualPending = true;         // the settled state is reported by serviceVisualNotice()
+            bootNoticeAbandoned = false;  // a new transition is a fresh chance for the Telegram API
             printState("Transicao:", current);
          }
 
