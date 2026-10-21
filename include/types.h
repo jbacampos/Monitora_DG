@@ -1,6 +1,9 @@
 #pragma once
 
-#include <Arduino.h>
+// Deliberately NOT <Arduino.h>: types.h only declares plain data and pure helpers, so the
+// same header compiles in the firmware and in the host tests (test/host). A .cpp that needs
+// the Arduino API includes <Arduino.h> itself.
+#include <stdint.h>
 
 // The four monitored electrical signals (always logical/normalised values).
 struct PowerState {
@@ -12,15 +15,82 @@ struct PowerState {
 
 // Explicit tag for a timestamp value, so epoch and millis() are never confused.
 enum class TsKind : uint8_t {
-   Epoch = 0,     // value = Unix epoch UTC (seconds)
-   SessionMillis, // value = millis() of THIS session (resolvable on next NTP)
-   LostSession    // value = millis() of a PREVIOUS session (not resolvable)
+   Epoch = 0,     // value = Unix epoch UTC (seconds); subsecond = ms within that second
+   SessionMillis, // value = millis() of THIS session (resolvable on next NTP); subsecond = 0
+   LostSession    // value = millis() of a PREVIOUS session (not resolvable); subsecond = 0
 };
 
+// A tagged instant.
+//
+// `value` keeps its original meaning (epoch seconds or millis), and `subsecond` adds the
+// millisecond fraction of an Epoch timestamp (0..999). SessionMillis is already in
+// milliseconds, so its subsecond is always 0.
+//
+// Why the fraction matters: the sampling period is 100 ms and a transfer of the ATS produces
+// several transitions in a row. With whole-second epochs, every event of the same second got
+// the SAME thingsboard ts, so the history could not tell them apart. ThingsBoard receives
+// `ts = value * 1000 + subsecond` (see timestampEpochMilliseconds).
+//
+// The field occupies bytes that used to be padding, so sizeof(Timestamp) (and therefore the
+// on-flash layouts of state.bin and pending.bin) is unchanged. Records written by an older
+// firmware have garbage in those bytes; timestampEpochMilliseconds() treats any value above
+// 999 as "no fraction" instead of publishing a bogus millisecond.
 struct Timestamp {
    TsKind kind = TsKind::SessionMillis;
+   uint16_t subsecond = 0;
    uint32_t value = 0;
 };
+
+static_assert(sizeof(Timestamp) == 8, "Timestamp layout changed");
+
+// Epoch milliseconds as published to ThingsBoard. Never uses millis() as an epoch.
+inline unsigned long long timestampEpochMilliseconds(const Timestamp &ts) {
+   const uint32_t sub = (ts.subsecond <= 999) ? ts.subsecond : 0;
+   return static_cast<unsigned long long>(ts.value) * 1000ULL + sub;
+}
+
+// Builds an Epoch timestamp from an instant of THIS session, relative to the NTP sync
+// reference (epochAtSync was read at syncMillis). `now` must be >= syncMillis in the same
+// millis() era.
+inline void setEpochTimestampFromInstant(Timestamp &ts, uint32_t epochAtSync, uint32_t syncMillis, uint32_t instantMillis) {
+   const uint32_t elapsedMs = instantMillis - syncMillis;
+
+   ts.kind = TsKind::Epoch;
+   ts.value = epochAtSync + (elapsedMs / 1000UL);
+   ts.subsecond = static_cast<uint16_t>(elapsedMs % 1000UL);
+}
+
+// Resolves a SessionMillis timestamp against the NTP sync reference, in place.
+//
+// The reference instant is treated as epochAtSync * 1000 ms. The fraction is derived from the
+// elapsed millis, so an event keeps its position INSIDE the second instead of being rounded to
+// the confirmation instant. Returns false when the timestamp is not SessionMillis or claims to
+// be in the future relative to the sync instant (which cannot happen for a valid session).
+inline bool resolveSessionTimestamp(Timestamp &ts, uint32_t epochAtSync, uint32_t syncMillis) {
+   if (ts.kind != TsKind::SessionMillis) {
+      return false;
+   }
+
+   if (ts.value > syncMillis) {
+      return false;
+   }
+
+   const uint32_t elapsedMs = syncMillis - ts.value;
+   const uint32_t wholeSeconds = elapsedMs / 1000UL;
+   const uint32_t remainderMs = elapsedMs % 1000UL;
+
+   ts.kind = TsKind::Epoch;
+
+   if (remainderMs == 0) {
+      ts.value = epochAtSync - wholeSeconds;
+      ts.subsecond = 0;
+   } else {
+      ts.value = epochAtSync - wholeSeconds - 1UL;
+      ts.subsecond = static_cast<uint16_t>(1000UL - remainderMs);
+   }
+
+   return true;
+}
 
 struct AliveRecord {
    Timestamp timestamp{};
@@ -177,4 +247,16 @@ static_assert(sizeof(PendingRecord) == 16, "PendingRecord size changed");
 inline bool samePowerState(const PowerState &a, const PowerState &b) {
    return a.redeDisponivel == b.redeDisponivel && a.alimentacaoRede == b.alimentacaoRede && a.alimentacaoOffgrid == b.alimentacaoOffgrid &&
           a.alimentacaoGerador == b.alimentacaoGerador;
+}
+
+// True when the composite cannot be a healthy steady state of the installation:
+//  - the load is fed by the grid while the grid is unavailable (backfeed), or
+//  - the load is fed by the grid and by the offgrid source at the same time.
+//
+// This is DIAGNOSTIC ONLY. The firmware never changes, drops or postpones a state because of
+// it: a contradiction that survives the debounce of all four channels is a real measurement
+// (auxiliary contact skew, contactor fault or wiring fault) and must be visible. The Serial
+// warning exists so such an event can be told apart from a history artifact.
+inline bool powerStateContradictory(const PowerState &s) {
+   return (s.alimentacaoRede && !s.redeDisponivel) || (s.alimentacaoRede && s.alimentacaoOffgrid);
 }

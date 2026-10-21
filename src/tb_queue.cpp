@@ -9,8 +9,16 @@ namespace {
 // pending.bin is tagged with this 4-byte magic so a legacy file (12-byte records, written
 // before the reboot reason existed) can be told apart from the current 16-byte format
 // unambiguously and upgraded in place, instead of being misread as garbage.
-constexpr uint32_t PENDING_MAGIC = 0x52444731u; // "RDG1" as stored
+//
+// RDG2 (1.5.0) only redefines two bytes that used to be padding: Timestamp gained a millisecond
+// fraction (subsecond) at offset 2, so sizeof(PendingRecord) and every other offset are
+// unchanged. RDG1 files therefore still parse, but those two bytes hold uninitialised padding;
+// begin() rewrites them once as 0 so an old record can never claim a bogus millisecond.
+constexpr uint32_t PENDING_MAGIC = 0x52444732u;    // "RDG2" as stored
+constexpr uint32_t PENDING_MAGIC_V1 = 0x52444731u; // "RDG1" (1.4.0 and older)
 constexpr size_t PENDING_HEADER_BYTES = sizeof(PENDING_MAGIC);
+
+enum class PendingFormat : uint8_t { Unknown, V1, Current };
 
 uint32_t completeCount(size_t fileSize) {
    if (fileSize < PENDING_HEADER_BYTES) {
@@ -20,17 +28,36 @@ uint32_t completeCount(size_t fileSize) {
    return static_cast<uint32_t>((fileSize - PENDING_HEADER_BYTES) / sizeof(PendingRecord));
 }
 
-// Reads the 4-byte header of an open file positioned at its start. Returns false when the
-// file does not carry the current format magic (legacy or truncated to less than a header).
-// The file position is left just after the header when it matches.
-bool readMagic(File &file) {
+// Reads the 4-byte header of an open file positioned at its start, leaving the position just
+// after it. Unknown covers both a legacy file (no header at all) and a file truncated below a
+// whole header.
+PendingFormat readFormat(File &file) {
    uint32_t magic = 0;
 
    if (file.read(reinterpret_cast<uint8_t *>(&magic), sizeof(magic)) != sizeof(magic)) {
-      return false;
+      return PendingFormat::Unknown;
    }
 
-   return magic == PENDING_MAGIC;
+   if (magic == PENDING_MAGIC) {
+      return PendingFormat::Current;
+   }
+
+   if (magic == PENDING_MAGIC_V1) {
+      return PendingFormat::V1;
+   }
+
+   return PendingFormat::Unknown;
+}
+
+bool readMagic(File &file) {
+   return readFormat(file) != PendingFormat::Unknown;
+}
+
+// A record read from a RDG1/legacy file may carry garbage in the bytes that are now `subsecond`.
+void sanitizeSubsecond(PendingRecord &record) {
+   if (record.timestamp.subsecond > 999) {
+      record.timestamp.subsecond = 0;
+   }
 }
 } // namespace
 
@@ -74,21 +101,28 @@ bool TbQueue::begin() {
       return true;
    }
 
-   if (!readMagic(file)) {
+   const PendingFormat format = readFormat(file);
+
+   if (format == PendingFormat::Unknown) {
       // Legacy layout (no header): upgrade it, preserving every complete record.
       file.close();
       return migrateLegacyFormat();
    }
 
+   const bool needsUpgrade = (format == PendingFormat::V1);
+
    file.close();
 
-   if (((size - PENDING_HEADER_BYTES) % sizeof(PendingRecord)) == 0) {
+   if (!needsUpgrade && ((size - PENDING_HEADER_BYTES) % sizeof(PendingRecord)) == 0) {
       return true;
    }
 
-   // Drop the partial trailing record left by a power loss mid-append.
-   Serial.println("pending.bin: cauda parcial reparada.");
-   return transformRecords(Transform::Copy, nullptr, 0);
+   if (!needsUpgrade) {
+      // Drop the partial trailing record left by a power loss mid-append.
+      Serial.println("pending.bin: cauda parcial reparada.");
+   }
+
+   return transformRecords(Transform::Sanitize, nullptr, 0);
 }
 
 bool TbQueue::migrateLegacyFormat() {
@@ -120,6 +154,7 @@ bool TbQueue::migrateLegacyFormat() {
 
    while (src.read(reinterpret_cast<uint8_t *>(&legacy), sizeof(LegacyRecord)) == sizeof(LegacyRecord)) {
       record.timestamp = legacy.timestamp;
+      record.timestamp.subsecond = 0; // those bytes were padding in the legacy layout
       record.power = legacy.power;
       record.rebootReason = REBOOT_REASON_NONE; // transitions carry no reboot reason
       dst.write(reinterpret_cast<const uint8_t *>(&record), sizeof(PendingRecord));
@@ -202,7 +237,12 @@ bool TbQueue::readAt(uint32_t index, PendingRecord &record) const {
    const size_t readBytes = file.read(reinterpret_cast<uint8_t *>(&record), sizeof(PendingRecord));
    file.close();
 
-   return readBytes == sizeof(PendingRecord);
+   if (readBytes != sizeof(PendingRecord)) {
+      return false;
+   }
+
+   sanitizeSubsecond(record);
+   return true;
 }
 
 bool TbQueue::reset() {
@@ -224,8 +264,10 @@ bool TbQueue::transformRecords(Transform mode, const TimeSource *time, uint32_t 
       return false;
    }
 
-   if (!readMagic(src)) {
-      // Not the current format: begin() upgrades a legacy file, so there is nothing safe to
+   const PendingFormat format = readFormat(src);
+
+   if (format == PendingFormat::Unknown) {
+      // Not a known format: begin() upgrades a legacy file, so there is nothing safe to
       // transform here (reading it as 16-byte records would produce garbage).
       src.close();
       return false;
@@ -240,12 +282,19 @@ bool TbQueue::transformRecords(Transform mode, const TimeSource *time, uint32_t 
 
    dst.write(reinterpret_cast<const uint8_t *>(&PENDING_MAGIC), sizeof(PENDING_MAGIC));
 
-   bool changed = false;
+   // A RDG1 file always needs a rewrite (garbage subsecond bytes and the old header), even when
+   // no record ends up changing.
+   bool changed = (format == PendingFormat::V1);
    uint32_t index = 0;
    PendingRecord record;
 
    while (src.read(reinterpret_cast<uint8_t *>(&record), sizeof(PendingRecord)) == sizeof(PendingRecord)) {
       const uint32_t position = index++;
+
+      if (record.timestamp.subsecond > 999) {
+         record.timestamp.subsecond = 0;
+         changed = true;
+      }
 
       if (mode == Transform::ToLost) {
          if (record.timestamp.kind == TsKind::SessionMillis) {

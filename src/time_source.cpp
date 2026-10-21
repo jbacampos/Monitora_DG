@@ -30,8 +30,9 @@ Timestamp TimeSource::now() const {
    Timestamp ts;
 
    if (synced_) {
-      ts.kind = TsKind::Epoch;
-      ts.value = epochAtSync_ + (millis() - millisAtSync_) / 1000UL;
+      // Keep the millisecond fraction: several ATS transitions fit inside one second and each
+      // must reach ThingsBoard with its own ts (see Timestamp in types.h).
+      setEpochTimestampFromInstant(ts, epochAtSync_, millisAtSync_, millis());
    } else {
       ts.kind = TsKind::SessionMillis;
       ts.value = millis();
@@ -41,20 +42,11 @@ Timestamp TimeSource::now() const {
 }
 
 bool TimeSource::resolve(Timestamp &ts) const {
-   if (ts.kind != TsKind::SessionMillis || !synced_) {
+   if (!synced_) {
       return false;
    }
 
-   if (millisAtSync_ < ts.value) {
-      // The event was taken after the sync instant; cannot happen in practice.
-      return false;
-   }
-
-   const uint32_t deltaSeconds = (millisAtSync_ - ts.value) / 1000UL;
-
-   ts.kind = TsKind::Epoch;
-   ts.value = epochAtSync_ - deltaSeconds;
-   return true;
+   return resolveSessionTimestamp(ts, epochAtSync_, millisAtSync_);
 }
 
 void TimeSource::formatBrasilia(uint32_t epoch, char *buffer, size_t length) {

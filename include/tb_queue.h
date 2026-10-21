@@ -6,12 +6,13 @@ class TimeSource;
 
 // Append-only ThingsBoard history log stored in LittleFS (PENDING_FILE).
 //
-// The file starts with a 4-byte format header (PENDING_MAGIC) followed by PendingRecord
+// The file starts with a 4-byte format header (PENDING_MAGIC, "RDG2") followed by PendingRecord
 // records. The header lets a legacy file (12-byte records, written before the reboot history
 // existed) be told apart unambiguously and upgraded in place by begin(), so history written
-// by an older firmware is preserved instead of being misread. Records are consumed strictly
-// in order through an external head index kept in PersistedState (tbLogHead). The file is
-// only truncated when the queue is fully drained, so history is never silently dropped.
+// by an older firmware is preserved instead of being misread. An "RDG1" header (1.4.0) is also
+// recognised and upgraded once. Records are consumed strictly in order through an external head
+// index kept in PersistedState (tbLogHead). The file is only truncated when the queue is fully
+// drained, so history is never silently dropped.
 class TbQueue {
 public:
    // Repairs a partially written tail left by a power loss during an append and upgrades a
@@ -37,7 +38,9 @@ public:
    bool resolveSessionTimestamps(const TimeSource &time, uint32_t head);
 
 private:
-   enum class Transform { Copy, ToLost, Resolve };
+   // Copy: repairs the file as-is. Sanitize: same, but also zeroes the millisecond fraction of
+   // records written by 1.4.0 (those bytes were padding then) and rewrites the RDG1 header.
+   enum class Transform { Copy, ToLost, Resolve, Sanitize };
 
    bool transformRecords(Transform mode, const TimeSource *time, uint32_t fromIndex);
 

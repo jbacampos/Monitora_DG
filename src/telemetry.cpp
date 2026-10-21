@@ -84,7 +84,9 @@ bool Telemetry::publishEvent(const PendingRecord &record) {
    }
 
    if (record.timestamp.kind == TsKind::Epoch) {
-      const unsigned long long ms = static_cast<unsigned long long>(record.timestamp.value) * 1000ULL;
+      // value * 1000 + subsecond: the millisecond fraction keeps events that happen inside the
+      // same second in order (and with distinct ts values) in the ThingsBoard history.
+      const unsigned long long ms = timestampEpochMilliseconds(record.timestamp);
 
       snprintf(payloadBuffer, sizeof(payloadBuffer), "{\"%s\":%llu,\"values\":{\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d%s}}", KEY_TS, ms, KEY_REDE_DISP,
                s.redeDisponivel ? 1 : 0, KEY_ALIM_REDE, s.alimentacaoRede ? 1 : 0, KEY_ALIM_OFFGRID, s.alimentacaoOffgrid ? 1 : 0, KEY_ALIM_GERADOR,
