@@ -96,6 +96,54 @@ reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da
    enviada.
 6. Reboot com `visDelId` != 0: a exclusao pendente e retomada apos o boot, antes de enviar
    a nova linha visual de boot.
+
+## Testes de logica no host (sem hardware)
+
+`test/host/test_logic.cpp` cobre a parte pura do firmware (debounce de um canal, portao composto
+do `InputGroup`, fracao de milissegundo do `Timestamp`, layout em Flash e diagnostico de
+contradicao). Nao usa Arduino, rede nem LittleFS: roda no PC.
+
+Compilar e executar a partir da raiz do repositorio:
+
+```text
+clang++ -std=c++17 -Wall -Wextra -Iinclude test/host/test_logic.cpp -o test/host/test_logic.exe
+.\test\host\test_logic.exe
+```
+
+(g++/MinGW funcionam igual. `test/host` esta em `test_ignore` no `platformio.ini` porque e um
+harness proprio com `main()`, nao uma suite Unity.)
+
+Saida esperada: `62 verificacoes, 0 falha(s)` seguido de `OK: toda a logica pura passou.` e
+codigo de saida 0 (o codigo de saida e o numero de falhas, limitado a 100).
+
+### Teste H1 - transferencia escalonada (widget "Historico de Transicoes")
+
+Cenario real: o ATS devolve a carga para a rede. O contator da rede fecha (`redeDisponivel`=1,
+`alimentacaoRede`=1) e, ~200 ms depois, o contator do offgrid abre (`alimentacaoOffgrid`=0).
+
+- Com a logica antiga (commit por canal confirmado) uma amostragem de 100 ms grava o composto
+  `1/1/1` no intervalo - um estado que nunca existiu. O teste **reproduz** essa logica e exige
+  que o artefato apareca (`legacySawImpossible`), provando que a regressao era real.
+- Com o portao (commit so quando os quatro canais estao assentados) o composto impossivel nunca
+  e produzido e a transferencia aparece uma unica vez, completa (`1/1/0`).
+
+### Teste H2 - sobreposicao real nao e escondida
+
+Se a sobreposicao durar mais que o debounce (contator emperrado, falha de fiacao), o estado e
+reportado como medido e o Serial registra `AVISO: estado eletrico contraditorio ...`. O firmware
+nunca corrige, atrasa nem descarta: o aviso existe para distinguir uma falha real de um artefato
+de historico.
+
+### Teste H3 - timestamps e compatibilidade
+
+- `Epoch` com fracao de milissegundo: duas transicoes dentro do mesmo segundo mantem instantes
+  distintos e a ordem correta; a conversao `SessionMillis -> Epoch` e exata de 0 a 5000 ms e
+  idempotente (um `Epoch` nunca e deslocado duas vezes).
+- Uma fracao invalida (registro gravado pela 1.4.0, quando esses bytes eram padding) e ignorada,
+  nunca publicada.
+- Guardas de layout: `sizeof(Timestamp)` = 8, `subsecond` no offset 2, `sizeof(PendingRecord)` =
+  16 - `state.bin` e `pending.bin` gravados pela 1.4.0 continuam legiveis.
+
 ## Rodada corretiva - testes especificos
 
 ### Teste 1 - Payload historico do ThingsBoard

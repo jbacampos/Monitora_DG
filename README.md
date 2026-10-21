@@ -20,6 +20,13 @@ Todas são tratadas **logicamente** como ACTIVE-HIGH. A inversão física é con
 canal em `include/config.h` (`INPUT_*_INVERTED`); o restante do firmware só vê o nível
 normalizado. As quatro entradas têm debounce; só uma transição confirmada gera evento.
 
+Os quatro sinais formam **uma** medição composta (`InputGroup`): nenhum snapshot é confirmado
+enquanto qualquer entrada ainda estiver no debounce. Confirmar por canal misturaria o valor novo
+de um canal com o valor ainda antigo dos outros e produziria combinações que nunca existiram (por
+exemplo "rede disponível + alimentado pela rede + alimentado pelo offgrid" no meio de uma
+transferência do ATS). Uma sobreposição que dure mais que o debounce é uma medição real: é
+publicada e o Serial registra `AVISO: estado eletrico contraditorio ...`.
+
 ## Estrutura
 
 ```text
@@ -27,6 +34,7 @@ include/
   config.h            pinos, inversao, timings, NTP/TZ, orcamento do log, chaves TB
   types.h             PowerState, TsKind/Timestamp, AliveRecord, PersistedState, PendingRecord
   input_monitor.h     aquisicao + debounce das 4 entradas
+  input_group.h       portao composto: commit so com as 4 entradas assentadas
   time_source.h       millis() + NTP; conversao SessionMillis -> Epoch
   state_store.h       state.bin (temp -> rename)
   tb_queue.h          pending.bin (log append-only para ThingsBoard)
@@ -38,6 +46,8 @@ include/
   secrets.h.example   credenciais (copie para secrets.h)
 src/
   (mesmos nomes .cpp) + main.cpp
+test/
+  host/test_logic.cpp testes de logica pura no PC (ver TESTES.md)
 ```
 
 ## Persistência
@@ -56,7 +66,9 @@ src/
 
 `Timestamp` carrega uma etiqueta `TsKind`:
 
-- `Epoch` - Unix UTC em segundos (NTP sincronizado).
+- `Epoch` - Unix UTC em segundos (NTP sincronizado) + fracao de milissegundo em
+  `Timestamp.subsecond`. O instante publicado usa os dois campos: duas transicoes dentro do mesmo
+  segundo mantem instantes distintos e nao colapsam no ThingsBoard.
 - `SessionMillis` - `millis()` da sessao atual (evento antes do NTP); convertido para
   `Epoch` assim que o NTP sincroniza.
 - `LostSession` - `SessionMillis` que sobreviveu a um reboot; o tempo absoluto e
@@ -80,6 +92,11 @@ reconcilia -> NTP -> monitora GPIO. Depois de estabilizar as entradas, compara o
 
 Primeira inicializacao: nenhum evento artificial. Em toda inicializacao e enfileirado
 um snapshot obrigatorio dos quatro estados para o ThingsBoard.
+
+A queda de `redeDisponivel` abre uma janela de graca (`REDE_FAIL_GRACE_MS`, 15 s): uma oscilacao
+mais curta nao gera FALTA. A janela e persistida e sobrevive a um reboot; a FALTA confirmada
+carrega o **instante da queda** e o estado eletrico medido naquele instante (antes de o ATS
+transferir a carga), nunca o estado do fim da janela.
 
 ## ThingsBoard
 
