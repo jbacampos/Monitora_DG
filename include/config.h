@@ -35,6 +35,11 @@ constexpr uint32_t INPUT_SAMPLE_MS    = 100;
 constexpr uint32_t INPUT_DEBOUNCE_MS  = 150;
 constexpr uint32_t INPUT_STABILIZE_MS = 400;
 
+// Hard bound for the boot stabilisation. A channel that keeps oscillating must never hang the
+// boot: after this the initial state is provisional and the first settled update() commits the
+// real composite. With the defaults this is 400 ms + 4 x 150 ms = 1000 ms.
+constexpr uint32_t INPUT_STABILIZE_MAX_MS = INPUT_STABILIZE_MS + (4UL * INPUT_DEBOUNCE_MS);
+
 // Grace window for a redeDisponivel 1 -> 0 transition. A mains blink shorter
 // than this is treated as transient: no FALTA is generated (no ThingsBoard event
 // and no Telegram notification). The window delays the CONFIRMATION only: the
