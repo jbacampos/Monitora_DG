@@ -75,6 +75,13 @@ namespace {
    // Re-armed after a reboot because millis() does not survive a reset.
    uint32_t redeFailGraceMillis = 0;
 
+   // Composite state captured at the INSTANT the fall was detected. The eventual FALTA event
+   // carries this snapshot with redeFailStarted (the original fall instant), not the state at
+   // the end of the grace window: during those 15 s the ATS normally transfers the load, so
+   // using the later state back-dated "fed by the offgrid/generator" to the fall, which is how
+   // a transfer could look like an impossible combination in the history.
+   PowerState redeFailState{};
+
    void saveState() {
       if (!stateStore.save(persisted)) {
          // Diagnostic-only: a failed save would silently lose the persisted ids/state and is
@@ -108,11 +115,13 @@ namespace {
    // true deadline, never earlier.
    bool redeFailGraceElapsed() {
       if (persisted.redeFailStarted.kind == TsKind::Epoch && timeSource.synced()) {
-         const uint32_t start = persisted.redeFailStarted.value;
-         const uint32_t nowEpoch = timeSource.now().value;
+         // Millisecond comparison: the fall instant carries a fraction now, and using whole
+         // seconds could confirm the FALTA up to ~1 s before the window really elapsed.
+         const unsigned long long startMs = timestampEpochMilliseconds(persisted.redeFailStarted);
+         const unsigned long long nowMs = timestampEpochMilliseconds(timeSource.now());
 
-         if (nowEpoch >= start) {
-            return static_cast<uint64_t>(nowEpoch - start) * 1000ULL >= REDE_FAIL_GRACE_MS;
+         if (nowMs >= startMs) {
+            return (nowMs - startMs) >= static_cast<unsigned long long>(REDE_FAIL_GRACE_MS);
          }
       }
 
@@ -135,7 +144,9 @@ namespace {
       Serial.printf("[%lu] REDE: FALTA confirmada (graca vencida) ts kind=%d value=%lu\n", static_cast<unsigned long>(millis()),
                     static_cast<int>(persisted.redeFailStarted.kind), static_cast<unsigned long>(persisted.redeFailStarted.value));
 
-      enqueue(persisted.power, persisted.redeFailStarted);
+      // redeFailState is the snapshot of the fall instant, taken before the ATS transferred the
+      // load; redeFailStarted is that same instant. The two always describe the same moment.
+      enqueue(redeFailState, persisted.redeFailStarted);
       notifier.onRedeTransition(persisted.redeFailStarted);
       saveState();
    }
@@ -144,6 +155,16 @@ namespace {
       const bool redeChanged = current.redeDisponivel != persisted.power.redeDisponivel;
       const bool previousRede = persisted.power.redeDisponivel;
 
+      // Diagnostic only: the firmware never rewrites, drops or postpones a contradictory state.
+      // A combination that survived the debounce of all four channels is a real measurement
+      // (auxiliary contact skew, contactor or wiring fault); the Serial line is what tells it
+      // apart from a history artifact. See powerStateContradictory() in types.h.
+      if (powerStateContradictory(current)) {
+         Serial.printf("[%lu] AVISO: estado eletrico contraditorio rede=%d alim_rede=%d offgrid=%d gerador=%d\n", static_cast<unsigned long>(millis()),
+                       current.redeDisponivel ? 1 : 0, current.alimentacaoRede ? 1 : 0, current.alimentacaoOffgrid ? 1 : 0,
+                       current.alimentacaoGerador ? 1 : 0);
+      }
+
       // A redeDisponivel 1 -> 0 is not a FALTA yet: it opens a grace window. Until
       // it elapses there is no ThingsBoard event and no Telegram notification.
       if (redeChanged && !current.redeDisponivel) {
@@ -151,6 +172,7 @@ namespace {
             persisted.redeFailGraceActive = true;
             persisted.redeFailStarted = ts;
             redeFailGraceMillis = millis();
+            redeFailState = current; // state of the fall instant (the FALTA is back-dated to it)
 
             Serial.printf("[%lu] REDE: queda detectada (graca %lums) ts kind=%d value=%lu\n", static_cast<unsigned long>(millis()),
                           static_cast<unsigned long>(REDE_FAIL_GRACE_MS), static_cast<int>(ts.kind), static_cast<unsigned long>(ts.value));
@@ -164,6 +186,7 @@ namespace {
       // The mains came back inside the grace window: the fall was transient.
       if (redeChanged && current.redeDisponivel && persisted.redeFailGraceActive) {
          persisted.redeFailGraceActive = false;
+         redeFailState = {};
 
          Serial.printf("[%lu] REDE: queda transitoria descartada (graca cancelada)\n", static_cast<unsigned long>(millis()));
 
@@ -264,12 +287,15 @@ namespace {
          if (after) {
             // The mains came back while the device was off: the fall was transient.
             persisted.redeFailGraceActive = false;
+            redeFailState = {};
             persisted.alive.timestamp = timeSource.now();
             persisted.alive.redeDisponivel = true;
 
             Serial.printf("[%lu] REDE: graca descartada apos reboot (rede voltou)\n", static_cast<unsigned long>(millis()));
          } else {
-            // Still down: keep waiting for the remainder of the window.
+            // Still down: keep waiting for the remainder of the window. The FALTA keeps the
+            // snapshot of the boot that observed the fall (the only one this session has).
+            redeFailState = actual;
             redeFailGraceMillis = millis();
 
             Serial.printf("[%lu] REDE: graca retomada apos reboot\n", static_cast<unsigned long>(millis()));
@@ -287,6 +313,7 @@ namespace {
          persisted.redeFailGraceActive = true;
          persisted.redeFailStarted = persisted.alive.timestamp; // best estimate of the fall instant
          redeFailGraceMillis = millis();
+         redeFailState = actual; // state observed at boot, back-dated to the estimated fall
          persisted.power = actual;
 
          Serial.printf("[%lu] REDE: queda detectada no boot (graca %lums)\n", static_cast<unsigned long>(millis()),
@@ -1018,7 +1045,12 @@ void loop() {
       lastSample = now;
       inputs.update(now);
 
-      if (inputs.changed()) {
+      // A transition is committed only when ALL four channels finished debouncing. Committing on
+      // the first channel that confirms (the previous behaviour) mixed the new value of that
+      // channel with the still-old values of the others, producing snapshots that never existed
+      // - e.g. "grid available + fed by the grid + fed by the offgrid" during a transfer. The
+      // edge is not lost: changed() is sticky until this point.
+      if (inputs.changed() && inputs.settled()) {
          const PowerState current = inputs.state();
 
          if (!samePowerState(current, persisted.power)) {
