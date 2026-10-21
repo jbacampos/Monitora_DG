@@ -2,3 +2,5 @@
 .vscode/
 include/secrets.h
 *.zip
+*.txt
+*.exe
