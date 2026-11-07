@@ -168,6 +168,16 @@ transferir a carga), nunca o estado do fim da janela.
   forma transitoria, o id fica pendente e nenhuma nova linha e enviada ate a exclusao ser
   confirmada; se a API recusar para sempre, o id e descartado e a linha atual e enviada. O texto de
   boot e a linha de boot permanecem inalterados.
+- **Exclusao preventiva (48 h)**: antes de cada mensagem propria (sticker FALTA, sticker RETORNO e
+  linha visual) completar 48 h, o firmware passa a apaga-la preventivamente a partir de ~60 min
+  antes do limite, com tentativas a cada ~5 min (respeitando `retry_after`), contando a partir do
+  horario **real de envio confirmado pela API** (o `date` do reply, nao o inicio da tentativa). O
+  horario e absoluto (epoch), insensivel a reboot e a mudanca de fuso. Apos apagar a linha visual,
+  uma **renovacao silenciosa** (`disable_notification=true`) e enviada e o ciclo de 48 h recomeca.
+  A mudanca real de estado tem prioridade: e enviada com notificacao normal, substitui a renovacao
+  pendente e evita uma renovacao redundante. Se a comunicacao faltar em toda a janela, a
+  impossibilidade e registrada e **nada** e bloqueado (comandos, ThingsBoard e FALTA/RETORNO
+  seguem normais).
 - **Mensagem de reinicio**: existe sempre no maximo **uma**. Mesmo esquema (Model B) da linha
   visual: o novo `message_id` e o anterior (`bootDeletePendingId`) sao persistidos ANTES de
   apagar o anterior; enquanto uma exclusao estiver pendente nenhuma nova mensagem de reinicio e

@@ -409,6 +409,29 @@ void testVisualQueue() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Preventive-deletion policy (ETAPA 2): open ~60 min before the 48 h limit, retry inside it and
+// give up past the mark; reboot-proof because it is pure absolute-time logic.
+// ---------------------------------------------------------------------------------------------
+void testMaintenancePolicy() {
+   const uint32_t sent = 1000000u;
+   const uint32_t windowStart = sent + TG_DELETE_WINDOW_START_S;
+   const uint32_t deadline = sent + TG_MESSAGE_TTL_S;
+
+   EXPECT(TG_MESSAGE_TTL_S == 172800u);
+   EXPECT(TG_DELETE_WINDOW_START_S == TG_MESSAGE_TTL_S - TG_DELETE_LEAD_S);
+   EXPECT(TG_DELETE_WINDOW_START_S == 169200u);
+
+   EXPECT(maintDecide(1, sent, 0, windowStart - 1) == MaintAction::None);                // too early
+   EXPECT(maintDecide(1, sent, 0, windowStart) == MaintAction::Attempt);                 // window open
+   EXPECT(maintDecide(1, sent, windowStart + 100, windowStart) == MaintAction::None);     // backoff gate
+   EXPECT(maintDecide(1, sent, windowStart - 100, windowStart) == MaintAction::Attempt);  // gate passed
+   EXPECT(maintDecide(1, sent, 0, deadline) == MaintAction::GiveUp);                      // 48 h passed
+   EXPECT(maintDecide((uint8_t)MaintState::Done, sent, 0, windowStart) == MaintAction::None);
+   EXPECT(maintDecide((uint8_t)MaintState::Expired, sent, 0, windowStart) == MaintAction::None);
+   EXPECT(maintDecide(1, 0, 0, deadline) == MaintAction::None); // unknown send time
+}
+
+// ---------------------------------------------------------------------------------------------
 // Real change vs silent renewal (ETAPA 2.4/2.5): a queued change always wins; the silent renewal
 // only goes out when nothing is queued.
 // ---------------------------------------------------------------------------------------------
@@ -493,6 +516,7 @@ int main() {
    testTimestamps();
    testContradictions();
    testVisualQueue();
+   testMaintenancePolicy();
    testVisualSendPriority();
    testStateMigration();
 

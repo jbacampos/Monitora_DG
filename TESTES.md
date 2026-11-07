@@ -105,6 +105,28 @@ reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da
 8. Reboot com `visDelId` != 0: a exclusao pendente e retomada apos o boot, antes de enviar a linha
    de boot.
 
+## M. Exclusao preventiva (48 h)
+
+1. Um `state.bin` migrado de 1.5.0 (ou anterior) carrega com os campos novos zerados: `fallM`,
+   `retM` e `visM` = 0 e `vq` = 0; nenhuma exclusao e agendada para mensagens antigas. No Serial:
+   `STATE: migrado de 84 para 156 bytes (estado anterior preservado).` Um `state.bin` com tamanho
+   desconhecido e recusado: `ERRO: state.bin com tamanho desconhecido (...); ignorado (defaults).`
+2. Bot administrador com `can_delete_messages`: gerar FALTA e RETORNO. A partir de ~60 min antes de
+   48 h o Serial mostra as tentativas preventivas (`fallM`/`retM` -> 2 e o sticker some do grupo).
+   O horario base e o `date` confirmado pela API (nao o inicio da tentativa).
+3. Linha visual: ao apagar preventivamente, `visId` = 0 e `renew` = 1; em seguida uma **renovacao
+   silenciosa** (`disable_notification=true`) e enviada, `visId` novo, `renew` = 0 e o ciclo de
+   48 h recomeca (Serial: `ligar LEDs (renovacao silenciosa)`).
+4. **Mudanca real durante a renovacao pendente**: a linha da transicao e enviada **com**
+   notificacao (tem prioridade) e `renew` volta a 0; **nenhuma** renovacao redundante e enviada
+   depois.
+5. Internet fora durante toda a janela: `fallM`/`retM`/`visM` viram 3 (expired) e o Serial registra
+   `janela de 48h vencida sem exclusao preventiva; desistindo`; nada fica bloqueado.
+6. Reboot no meio da janela: o `nextAttempt` persistido e respeitado (o backoff sobrevive).
+7. Durante toda a manutencao: `/reboot` e `/ota` continuam respondendo e as transicoes eletricas
+   continuam sendo registradas (ThingsBoard) — roda no maximo uma acao por passagem e nunca
+   enquanto `tgPhase != NONE`.
+
 ## Testes de logica no host (sem hardware)
 
 `test/host/test_logic.cpp` cobre a parte pura do firmware (debounce de um canal, portao composto

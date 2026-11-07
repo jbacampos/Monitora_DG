@@ -6,6 +6,7 @@
 #include "secrets.h"
 #include "state_store.h"
 #include "telegram.h"
+#include "tg_maint.h"
 #include "time_source.h"
 
 namespace {
@@ -348,6 +349,16 @@ void TelegramNotifier::stepDelOld() {
       return;
    }
 
+   // Both stickers of the previous cycle were resolved (deleted, already gone or refused): their
+   // preventive-deletion tracking is reset, since they no longer exist. A new cycle starts them
+   // again on the next FALTA/RETORNO sends.
+   state_->fallStickerSentEpoch = 0;
+   state_->fallStickerNextAttempt = 0;
+   state_->fallStickerMaint = static_cast<uint8_t>(MaintState::None);
+   state_->retStickerSentEpoch = 0;
+   state_->retStickerNextAttempt = 0;
+   state_->retStickerMaint = static_cast<uint8_t>(MaintState::None);
+
    state_->tgPhase = TG_PHASE_SEND_FALL;
    save();
 }
@@ -402,12 +413,13 @@ bool TelegramNotifier::resolveStickerDelete(int32_t &id, const char *label) {
 
 void TelegramNotifier::stepSendFall() {
    int32_t messageId = 0;
+   uint32_t dateEpoch = 0;
 
    const uint32_t tSend = millis();
 
    Serial.printf("[%lu] TG: SEND_FALL inicio\n", static_cast<unsigned long>(tSend));
 
-   const bool ok = telegram_->sendSticker(TELEGRAM_OLI_STICKER, messageId);
+   const bool ok = telegram_->sendSticker(TELEGRAM_OLI_STICKER, messageId, dateEpoch);
 
    Serial.printf("[%lu] TG: SEND_FALL resultado=%s message_id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
                  static_cast<long>(messageId), static_cast<unsigned long>(millis() - tSend));
@@ -418,6 +430,17 @@ void TelegramNotifier::stepSendFall() {
 
    state_->lastFallStickerId = messageId;
    state_->lastReturnStickerId = 0;
+
+   // A fresh FALTA sticker: start its own preventive-deletion cycle from the API-confirmed send
+   // instant. The RETORNO sticker of the previous cycle was already deleted by DEL_OLD.
+   state_->fallStickerSentEpoch = dateEpoch;
+   state_->fallStickerNextAttempt = 0;
+   state_->fallStickerMaint = static_cast<uint8_t>(MaintState::Waiting);
+
+   state_->retStickerSentEpoch = 0;
+   state_->retStickerNextAttempt = 0;
+   state_->retStickerMaint = static_cast<uint8_t>(MaintState::None);
+
    state_->tgPhase = TG_PHASE_TEXT_FALL;
    save();
 }
@@ -441,12 +464,13 @@ void TelegramNotifier::stepTextFall() {
 
 void TelegramNotifier::stepSendRet() {
    int32_t messageId = 0;
+   uint32_t dateEpoch = 0;
 
    const uint32_t tSend = millis();
 
    Serial.printf("[%lu] TG: SEND_RET inicio\n", static_cast<unsigned long>(tSend));
 
-   const bool ok = telegram_->sendSticker(TELEGRAM_HUNO_STICKER, messageId);
+   const bool ok = telegram_->sendSticker(TELEGRAM_HUNO_STICKER, messageId, dateEpoch);
 
    Serial.printf("[%lu] TG: SEND_RET resultado=%s message_id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
                  static_cast<long>(messageId), static_cast<unsigned long>(millis() - tSend));
@@ -456,6 +480,13 @@ void TelegramNotifier::stepSendRet() {
    }
 
    state_->lastReturnStickerId = messageId;
+
+   // A fresh RETORNO sticker: start its own preventive-deletion cycle from the confirmed send
+   // instant. The FALTA sticker is preserved (RETORNO never deletes it).
+   state_->retStickerSentEpoch = dateEpoch;
+   state_->retStickerNextAttempt = 0;
+   state_->retStickerMaint = static_cast<uint8_t>(MaintState::Waiting);
+
    state_->tgPhase = TG_PHASE_TEXT_RET;
    save();
 }
