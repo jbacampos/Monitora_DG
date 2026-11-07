@@ -4,6 +4,7 @@
 // same header compiles in the firmware and in the host tests (test/host). A .cpp that needs
 // the Arduino API includes <Arduino.h> itself.
 #include <stdint.h>
+#include <string.h>
 
 // The four monitored electrical signals (always logical/normalised values).
 struct PowerState {
@@ -352,11 +353,56 @@ inline const char *rebootReasonDescription(uint8_t code) {
       case REBOOT_REASON_EXTERNAL_SYSTEM:
          return "Reset externo";
       case REBOOT_REASON_OTA:
-         return "Atualização (/ota)";
+         return "Atualização OTA (/ota)";
       case REBOOT_REASON_UNKNOWN:
       default:
          return "Desconhecido";
    }
+}
+
+// Maps the platform reset reason (the exact string ESP.getResetReason() returns) plus the persisted
+// OTA marker to the stable RebootReason code. The OTA marker WINS over every reset-reason string: an
+// ESP8266 OTA flash reboots as a generic "Software/System restart" (the very same string a /reboot
+// produces), so the marker is the only way to tell an update from a /reboot. Pure: covered by the
+// host tests.
+inline uint8_t classifyBootReason(bool otaMarker, const char *resetReason) {
+   if (otaMarker) {
+      return REBOOT_REASON_OTA;
+   }
+
+   if (resetReason == nullptr) {
+      return REBOOT_REASON_UNKNOWN;
+   }
+
+   if (strcmp(resetReason, "Power On") == 0) {
+      return REBOOT_REASON_POWER_ON;
+   }
+
+   if (strcmp(resetReason, "Hardware Watchdog") == 0) {
+      return REBOOT_REASON_HARDWARE_WATCHDOG;
+   }
+
+   if (strcmp(resetReason, "Exception") == 0) {
+      return REBOOT_REASON_EXCEPTION;
+   }
+
+   if (strcmp(resetReason, "Software Watchdog") == 0) {
+      return REBOOT_REASON_SOFTWARE_WATCHDOG;
+   }
+
+   if (strcmp(resetReason, "Software/System restart") == 0) {
+      return REBOOT_REASON_SOFTWARE_RESTART;
+   }
+
+   if (strcmp(resetReason, "Deep-Sleep Wake") == 0) {
+      return REBOOT_REASON_DEEP_SLEEP;
+   }
+
+   if (strcmp(resetReason, "External System") == 0) {
+      return REBOOT_REASON_EXTERNAL_SYSTEM;
+   }
+
+   return REBOOT_REASON_UNKNOWN;
 }
 
 // A ThingsBoard history record: a snapshot associated with a detected change.

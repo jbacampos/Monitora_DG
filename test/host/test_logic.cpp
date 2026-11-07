@@ -771,6 +771,37 @@ void testStatusMessage() {
    EXPECT(strstr(msg, "Firmware: 9.9.9") != nullptr);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Reboot reason: the persisted OTA marker must WIN over the ESP reset-reason string (an OTA flash
+// reboots as a generic "Software/System restart", exactly the /reboot string), and the two reasons
+// the task distinguishes must map to their own code and text.
+// ---------------------------------------------------------------------------------------------
+void testBootReason() {
+   // The OTA marker wins regardless of the platform reason, even the very same "/reboot" string.
+   EXPECT(classifyBootReason(true, "Software/System restart") == REBOOT_REASON_OTA);
+   EXPECT(classifyBootReason(true, "Power On") == REBOOT_REASON_OTA);
+   EXPECT(classifyBootReason(true, nullptr) == REBOOT_REASON_OTA);
+
+   // /reboot: a generic software restart WITHOUT the OTA marker.
+   EXPECT(classifyBootReason(false, "Software/System restart") == REBOOT_REASON_SOFTWARE_RESTART);
+
+   // Every other platform reason keeps its own code.
+   EXPECT(classifyBootReason(false, "Power On") == REBOOT_REASON_POWER_ON);
+   EXPECT(classifyBootReason(false, "Hardware Watchdog") == REBOOT_REASON_HARDWARE_WATCHDOG);
+   EXPECT(classifyBootReason(false, "Exception") == REBOOT_REASON_EXCEPTION);
+   EXPECT(classifyBootReason(false, "Software Watchdog") == REBOOT_REASON_SOFTWARE_WATCHDOG);
+   EXPECT(classifyBootReason(false, "Deep-Sleep Wake") == REBOOT_REASON_DEEP_SLEEP);
+   EXPECT(classifyBootReason(false, "External System") == REBOOT_REASON_EXTERNAL_SYSTEM);
+   EXPECT(classifyBootReason(false, "algum outro texto") == REBOOT_REASON_UNKNOWN);
+   EXPECT(classifyBootReason(false, "") == REBOOT_REASON_UNKNOWN);
+   EXPECT(classifyBootReason(false, nullptr) == REBOOT_REASON_UNKNOWN);
+
+   // The Telegram/Serial text of the two reasons (ASCII anchors only, so the check is encoding-safe).
+   EXPECT(strstr(rebootReasonDescription(REBOOT_REASON_SOFTWARE_RESTART), "/reboot") != nullptr);
+   EXPECT(strstr(rebootReasonDescription(REBOOT_REASON_OTA), "OTA") != nullptr);
+   EXPECT(strstr(rebootReasonDescription(REBOOT_REASON_OTA), "/ota") != nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -789,6 +820,7 @@ int main() {
    testStickerFlow();
    testTgCommandParsing();
    testStatusMessage();
+   testBootReason();
 
    printf("\n%d verificacoes, %d falha(s)\n", checks, failures);
 

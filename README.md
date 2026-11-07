@@ -130,7 +130,7 @@ transferir a carga), nunca o estado do fim da janela.
   | 6 | `Deep-Sleep Wake` | Despertar de deep sleep |
   | 7 | `External System` | Reset externo |
   | 8 | `Unknown` | Desconhecido |
-  | 9 | OTA (`pendingBootReason`) | Atualização (OTA) |
+  | 9 | OTA (`pendingBootReason`) | Atualização OTA (/ota) |
 - `v1/devices/me/attributes`: heartbeat de supervisao (~60 s) com `last_alive`,
   `uptime_s`, `wifi_rssi`. O `last_alive` do TB **nao** e usado para reconstrucao.
 - Fila persistente append-only (orcamento ~512 KB => dezenas de milhares de eventos).

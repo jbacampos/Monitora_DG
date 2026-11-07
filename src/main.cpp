@@ -241,42 +241,15 @@ namespace {
    // string ESP.getResetReason() returns (the same text the boot notice shows), so the published
    // "reboot_reason" matches the Telegram notice.
    uint8_t currentBootReasonCode() {
-      if (persisted.pendingBootReason == BOOT_REASON_OTA) {
-         return REBOOT_REASON_OTA;
-      }
-
-      // Detection is UNCHANGED: it classifies the exact string ESP.getResetReason() returns
-      // (the same source the boot notice always used). Only the DISPLAY is translated to
-      // Portuguese, through rebootReasonDescription().
-      const String reason = ESP.getResetReason();
-
-      if (reason == "Power On") {
-         return REBOOT_REASON_POWER_ON;
-      }
-      if (reason == "Hardware Watchdog") {
-         return REBOOT_REASON_HARDWARE_WATCHDOG;
-      }
-      if (reason == "Exception") {
-         return REBOOT_REASON_EXCEPTION;
-      }
-      if (reason == "Software Watchdog") {
-         return REBOOT_REASON_SOFTWARE_WATCHDOG;
-      }
-      if (reason == "Software/System restart") {
-         return REBOOT_REASON_SOFTWARE_RESTART;
-      }
-      if (reason == "Deep-Sleep Wake") {
-         return REBOOT_REASON_DEEP_SLEEP;
-      }
-      if (reason == "External System") {
-         return REBOOT_REASON_EXTERNAL_SYSTEM;
-      }
-
-      return REBOOT_REASON_UNKNOWN;
+      // The OTA marker (persisted) is the ONLY way to tell an update reboot from a /reboot: an
+      // ESP8266 OTA flash reboots as a generic "Software/System restart", the very same string a
+      // /reboot produces. classifyBootReason() is pure and covered by the host tests.
+      return classifyBootReason(persisted.pendingBootReason == BOOT_REASON_OTA, ESP.getResetReason().c_str());
    }
 
    void reconcileBoot() {
-      bootReasonCode = currentBootReasonCode();
+      // bootReasonCode was already captured in setup(), BEFORE runPendingOtaIfRequested() (which may
+      // clear the OTA marker while attempting the update).
 
       const PowerState actual = inputs.state();
 
@@ -527,6 +500,9 @@ namespace {
 
             persisted.tgUpdateOffset = telegram.updateOffset();
             persisted.otaRequested = true;
+            // Mark THIS reboot as the OTA one, so the boot that runs the update (and the clean boot
+            // after it) reports "Atualização OTA" instead of the generic "/reboot".
+            persisted.pendingBootReason = BOOT_REASON_OTA;
             saveState();
 
             delay(100);
@@ -1161,6 +1137,11 @@ void setup() {
    }
 
    heapDiag("setup:pos-load");
+
+   // Capture the boot reason HERE, before runPendingOtaIfRequested(): that routine may clear the
+   // persisted OTA marker while attempting the update, which would otherwise turn an OTA reboot into
+   // a "/reboot" in the boot notice.
+   bootReasonCode = currentBootReasonCode();
 
    wifi.begin();
 
