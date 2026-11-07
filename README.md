@@ -42,6 +42,7 @@ include/
   telegram.h          API HTTP de baixo nivel do Telegram
   telegram_notifier.h coalescimento, stickers e textos
   tg_maint.h          decisao de envio da fila visual (pura, testavel no host)
+  sticker_maint.h     politica da manutencao dos stickers FALTA/RETORNO (pura, testavel no host)
   wifi_manager.h      conectividade
   ota.h               /ota
   secrets.h.example   credenciais (copie para secrets.h)
@@ -55,13 +56,15 @@ test/
 
 - `/state.bin` = um unico `PersistedState`, escrito em `/state.tmp` e depois `rename`
   (o rename do LittleFS substitui o destino de forma atomica). Sem CRC e sem slots A/B.
-  A versao 1.6.0 acrescentou no **fim** da struct a fila de fotografias visuais (`visualQueue`);
-  todos os campos anteriores mantem offset e tipo, entao um `state.bin` antigo e um **prefixo**
-  exato do atual. Tamanhos reconhecidos: 60/68/76/84 (1.0.0..1.5.0) e o atual (120).
-  `StateStore::load()` adota o prefixo (os campos novos ficam nos valores seguros = zero: a fila
-  visual comeca vazia), grava a migracao de forma **atomica** (temp + rename; o original e
+  As versoes 1.6.x acrescentaram campos **no fim** da struct (fila visual em 1.6.0; manutencao dos
+  stickers FALTA/RETORNO em 1.6.1); todos os campos anteriores mantem offset e tipo, entao um
+  `state.bin` antigo e um **prefixo** exato do atual. Tamanhos reconhecidos: 60/68/76
+  (desenvolvimento), 84 (1.3.1..1.5.0, efetivamente instalado) e 120 (firmware anterior, fila
+  visual); o atual e 636. `StateStore::load()` adota o prefixo (os campos novos ficam nos valores
+  seguros = zero: a fila visual comeca vazia e nenhuma exclusao/edicao e agendada para eventos
+  anteriores a atualizacao), grava a migracao de forma **atomica** (temp + rename; o original e
   preservado ate o rename) e recusa qualquer tamanho **desconhecido** com diagnostico explicito
-  (um arquivo parcial nunca e interpretado como estado valido).
+  (156, um formato abandonado que nunca foi instalado, nao e reconhecido).
 - `/pending.bin` = log **append-only** de `PendingRecord` (16 B: `Timestamp` 8 + `PowerState`
   4 + `rebootReason` 1 + 3 de alinhamento), precedido por um cabecalho de formato de 4 B
   (`PENDING_MAGIC`). O `tbLogHead` (em `state.bin`) aponta o proximo registro a publicar. O
@@ -166,7 +169,19 @@ transferir a carga), nunca o estado do fim da janela.
   `visualDeletePendingId`) sao persistidos ANTES de apagar o anterior. Se a exclusao falhar de
   forma transitoria, o id fica pendente e nenhuma nova linha e enviada ate a exclusao ser
   confirmada; se a API recusar para sempre, o id e descartado e a linha atual e enviada. O texto de
-  boot e a linha de boot permanecem inalterados.
+  boot e a linha de boot permanecem inalterados. **Todas** as mensagens da linha visual (boot e
+  transicoes) sao enviadas com `disable_notification=true` (nunca tocam o som) e a manutencao
+  preventiva NUNCA apaga nem reenvia a linha visual.
+- **Manutencao dos stickers FALTA/RETORNO**: cada sticker e controlado individualmente. A contagem
+  comeca no horario real de envio confirmado pela API (o `date` do reply, nao o inicio da tentativa).
+  As 36 h iniciam as tentativas de exclusao (a cada 15 min, respeitando `retry_after`) ate 48 h; se
+  nao for possivel dentro da janela, a ocorrencia e registrada. Apos a confirmacao da exclusao, a
+  mensagem textual original e **simplificada** com `editMessageText` (sem enviar nova mensagem,
+  mantendo o `message_id`), preservando o instante original do evento. Exclusao e edicao sao
+  operacoes independentes e persistentes: se a edicao falhar, a pendencia e retomada (inclusive
+  apos reboot). Quando o `DEL_OLD` apaga os stickers do ciclo anterior antes das 36 h, a
+  simplificacao correspondente entra numa fila persistida para nao perder a associacao. Os textos
+  nunca sao apagados.
 - **Mensagem de reinicio**: existe sempre no maximo **uma**. Mesmo esquema (Model B) da linha
   visual: o novo `message_id` e o anterior (`bootDeletePendingId`) sao persistidos ANTES de
   apagar o anterior; enquanto uma exclusao estiver pendente nenhuma nova mensagem de reinicio e

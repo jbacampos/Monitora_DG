@@ -18,9 +18,12 @@
 // keeps its defaults and logs a diagnostic).
 namespace StateMigration {
 
-// Historical sizes of PersistedState, oldest first (firmware 1.0.0 .. 1.5.0). Each is a prefix of
-// the current layout because fields were only ever appended.
-constexpr size_t kLegacySizes[] = {60, 68, 76, 84};
+// Historical sizes of PersistedState, oldest first. Each is a prefix of the current layout because
+// fields were only ever appended: 60/68/76 (development) and 84 (1.3.1..1.5.0, the version actually
+// installed on the device). 120 is the layout produced by the immediately-previous committed
+// firmware (fila visual), so a device flashed with it is upgraded in place. 156 (an abandoned
+// intermediate that was reverted before any release) is deliberately NOT recognised.
+constexpr size_t kLegacySizes[] = {60, 68, 76, 84, 120};
 
 // True when `fileSize` is one of the recognised historical sizes.
 inline bool isLegacySize(size_t fileSize) {

@@ -22,6 +22,7 @@
 
 #include "input_group.h"
 #include "state_store.h"
+#include "sticker_maint.h"
 #include "tg_maint.h"
 #include "types.h"
 
@@ -418,18 +419,17 @@ void testVisualSendDecision() {
 
 // ---------------------------------------------------------------------------------------------
 // state.bin migration: an older image is an exact byte-prefix of the current layout (fields were
-// only ever appended). The historical layouts 60/68/76/84 bytes are REAL fixtures: the byte prefix
-// of a fully populated PersistedState IS the old on-flash layout. Each fixture is adopted into the
-// current 120-byte layout and every field that existed before it is preserved, while the fields
-// introduced later start at their safe defaults and the ETAPA-1 visual queue starts empty. An
-// unknown size is rejected (never partially interpreted).
+// only ever appended). The historical layouts 60/68/76/84/120 bytes are REAL fixtures: the byte
+// prefix of a fully populated PersistedState IS the old on-flash layout. Each fixture is adopted
+// into the current layout and every field that existed before it is preserved, while the fields
+// introduced later start at their safe defaults. An unknown size is rejected.
 // ---------------------------------------------------------------------------------------------
 void testStateMigration() {
-   const size_t sizes[4] = {60, 68, 76, 84};
+   const size_t sizes[5] = {60, 68, 76, 84, 120};
 
-   EXPECT(sizeof(PersistedState) == 120);
+   EXPECT(sizeof(PersistedState) == 636);
 
-   for (size_t s = 0; s < 4; ++s) {
+   for (size_t s = 0; s < 5; ++s) {
       const size_t size = sizes[s];
       const int fixtureFailures = failures;
 
@@ -461,8 +461,11 @@ void testStateMigration() {
       full.visualDeletePendingId = 888;
       full.lastBootMessageId = 999;
       full.bootDeletePendingId = 1010;
+      // Fill the visual queue so its preservation (>= 120 bytes) can be checked below.
+      full.visualQueue.push(makeState(false, false, true, false));
+      full.visualQueue.push(makeState(true, true, false, false));
 
-      uint8_t fixture[84];
+      uint8_t fixture[120];
       memcpy(fixture, &full, size);
 
       EXPECT(StateMigration::isLegacySize(size));
@@ -519,12 +522,27 @@ void testStateMigration() {
          EXPECT(m.bootDeletePendingId == 0);
       }
 
-      // The ETAPA-1 visual queue is always initialised empty (no artificial line).
-      EXPECT(m.visualQueue.empty());
-      EXPECT(m.visualQueue.count == 0);
+      // The visual queue exists from 120 bytes on.
+      if (size >= 120) {
+         EXPECT(m.visualQueue.count == 2);
+         EXPECT_STATE(*m.visualQueue.front(), false, false, true, false);
+      } else {
+         EXPECT(m.visualQueue.empty());
+         EXPECT(m.visualQueue.count == 0);
+      }
       EXPECT(m.visualQueue.dropped == 0);
 
-      printf("  migracao %2u B -> %u B: %s\n", static_cast<unsigned>(size), static_cast<unsigned>(sizeof(PersistedState)),
+      // The sticker-maintenance fields (appended after 120) always start at their safe defaults:
+      // no artificial deletion and no artificial edit for events created before the upgrade.
+      EXPECT(m.fallMaint.stickerId == 0);
+      EXPECT(m.fallMaint.textId == 0);
+      EXPECT(m.fallMaint.state == 0);
+      EXPECT(m.returnMaint.stickerId == 0);
+      EXPECT(m.returnMaint.state == 0);
+      EXPECT(m.editQueue.empty());
+      EXPECT(m.editQueue.count == 0);
+
+      printf("  migracao %3u B -> %u B: %s\n", static_cast<unsigned>(size), static_cast<unsigned>(sizeof(PersistedState)),
              (failures == fixtureFailures) ? "OK" : "FALHOU");
    }
 
@@ -535,12 +553,138 @@ void testStateMigration() {
    EXPECT(!StateMigration::isKnownSize(85));
    EXPECT(!StateMigration::isKnownSize(sizeof(PersistedState) + 1));
 
-   uint8_t junk[84] = {0};
+   uint8_t junk[120] = {0};
    PersistedState untouched{};
 
    EXPECT(!StateMigration::adopt(junk, 156, untouched));
    EXPECT(!StateMigration::adopt(junk, 85, untouched));
    EXPECT(!StateMigration::adopt(junk, 60 + 1, untouched));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sticker maintenance policy (absolute-time windows): keep before 36 h, delete from 36 h to 48 h,
+// retry every 15 min (or the API retry_after), give up past 48 h; the text edit is independent of
+// the 48 h limit.
+// ---------------------------------------------------------------------------------------------
+void testStickerPolicy() {
+   const uint32_t sent = 1000000u;
+   const uint32_t start = sent + STICKER_DELETE_START_S; // 36 h
+   const uint32_t ttl = sent + STICKER_TTL_S;            // 48 h
+
+   EXPECT(STICKER_DELETE_START_S == 129600u);
+   EXPECT(STICKER_TTL_S == 172800u);
+   EXPECT(STICKER_RETRY_S == 900u);
+
+   const StickerMaintState waiting = StickerMaintState::Waiting;
+   const StickerMaintState deleting = StickerMaintState::DeletePending;
+   const StickerMaintState editing = StickerMaintState::EditPending;
+
+   // 1. before 36 h: nothing to do.
+   EXPECT(stickerDecide(waiting, sent, 0, start - 1) == StickerAction::None);
+   EXPECT(stickerDecide(deleting, sent, 0, start - 1) == StickerAction::None);
+
+   // 2. at 36 h: start deleting.
+   EXPECT(stickerDecide(waiting, sent, 0, start) == StickerAction::Delete);
+
+   // 3. a failed attempt gates the next one for 15 min.
+   EXPECT(stickerDecide(deleting, sent, start + STICKER_RETRY_S, start) == StickerAction::None);
+   EXPECT(stickerDecide(deleting, sent, start + STICKER_RETRY_S, start + STICKER_RETRY_S) == StickerAction::Delete);
+
+   // 4. a 429 retry_after longer than 15 min is honoured (gate far in the future).
+   EXPECT(stickerDecide(deleting, sent, start + 3000, start + 2900) == StickerAction::None);
+
+   // 11. 48 h passed without success: give up (never schedules past the limit).
+   EXPECT(stickerDecide(deleting, sent, 0, ttl) == StickerAction::GiveUp);
+
+   // 5/12. EditPending ignores the 48 h limit and only honours its own gate.
+   EXPECT(stickerDecide(editing, sent, 0, ttl + 100000) == StickerAction::Edit);
+   EXPECT(stickerDecide(editing, sent, ttl + 100001, ttl + 100000) == StickerAction::None);
+
+   // Done / Expired / None: nothing, ever.
+   EXPECT(stickerDecide(StickerMaintState::Done, sent, 0, start) == StickerAction::None);
+   EXPECT(stickerDecide(StickerMaintState::Expired, sent, 0, start) == StickerAction::None);
+   EXPECT(stickerDecide(StickerMaintState::None, sent, 0, start) == StickerAction::None);
+
+   // An unknown send instant cannot be scheduled.
+   EXPECT(stickerDecide(waiting, 0, 0, ttl) == StickerAction::None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Persisted edit queue: FALTA and RETORNO are independent entries, order is preserved and the
+// overflow coalesces the oldest (reported, never silent).
+// ---------------------------------------------------------------------------------------------
+void testStickerQueue() {
+   StickerEditQueue q;
+   EXPECT(q.empty());
+   EXPECT(q.front() == nullptr);
+
+   StickerEvent a{};
+   a.textId = 11;
+   a.state = static_cast<uint8_t>(StickerMaintState::EditPending);
+   StickerEvent b{};
+   b.textId = 22;
+   b.state = static_cast<uint8_t>(StickerMaintState::EditPending);
+
+   EXPECT(q.push(a));
+   EXPECT(q.push(b));
+   EXPECT(q.count == 2);
+   EXPECT(q.front()->textId == 11);
+   q.pop();
+   EXPECT(q.front()->textId == 22);
+   q.pop();
+   EXPECT(q.empty());
+
+   // Overflow: the OLDEST is coalesced and counted.
+   for (uint8_t i = 0; i < STICKER_EDIT_QUEUE_CAP; ++i) {
+      StickerEvent e{};
+      e.textId = 100 + i;
+      EXPECT(q.push(e));
+   }
+   EXPECT(q.count == STICKER_EDIT_QUEUE_CAP);
+
+   StickerEvent extra{};
+   extra.textId = 999;
+   EXPECT(!q.push(extra));
+   EXPECT(q.count == STICKER_EDIT_QUEUE_CAP);
+   EXPECT(q.dropped == 1);
+   EXPECT(q.front()->textId == 101); // 100 was coalesced away
+}
+
+// ---------------------------------------------------------------------------------------------
+// The intended runtime flow, exercised through the pure decisions. The runtime in main.cpp makes
+// exactly these state transitions.
+// ---------------------------------------------------------------------------------------------
+void testStickerFlow() {
+   const uint32_t sent = 1000000u;
+   const uint32_t start = sent + STICKER_DELETE_START_S;
+
+   EXPECT(stickerDecide(StickerMaintState::Waiting, sent, 0, start - 1) == StickerAction::None); // 1
+   EXPECT(stickerDecide(StickerMaintState::Waiting, sent, 0, start) == StickerAction::Delete);   // 2
+
+   // 3. transient failure -> next attempt 15 min later.
+   const uint32_t next = start + STICKER_RETRY_S;
+   EXPECT(stickerDecide(StickerMaintState::DeletePending, sent, next, start + 1) == StickerAction::None);
+   EXPECT(stickerDecide(StickerMaintState::DeletePending, sent, next, next) == StickerAction::Delete);
+
+   // 5/6. deletion confirmed -> EditPending -> edit -> Done.
+   EXPECT(stickerDecide(StickerMaintState::EditPending, sent, 0, next) == StickerAction::Edit);
+   EXPECT(stickerDecide(StickerMaintState::Done, sent, 0, next) == StickerAction::None);
+
+   // 7. a failed edit keeps EditPending and retries 15 min later.
+   EXPECT(stickerDecide(StickerMaintState::EditPending, sent, next + STICKER_RETRY_S, next) == StickerAction::None);
+   EXPECT(stickerDecide(StickerMaintState::EditPending, sent, next + STICKER_RETRY_S, next + STICKER_RETRY_S) == StickerAction::Edit);
+
+   // 8/9/13. the decisions are pure absolute-time functions: a reboot (re-loading the persisted
+   // state) or a reconnection inside the window yields exactly the same answer.
+   EXPECT(stickerDecide(StickerMaintState::DeletePending, sent, 0, start) == StickerAction::Delete);
+   EXPECT(stickerDecide(StickerMaintState::EditPending, sent, 0, start) == StickerAction::Edit);
+   EXPECT(stickerDecide(StickerMaintState::DeletePending, sent, start - 5000, start + 1000) == StickerAction::Delete);
+
+   // 10. FALTA and RETORNO are independent absolute-time timers (different send instants).
+   const uint32_t sentRet = sent + 17;
+   EXPECT(stickerDecide(StickerMaintState::Waiting, sent, 0, sentRet + STICKER_DELETE_START_S) == StickerAction::Delete);
+   EXPECT(stickerDecide(StickerMaintState::Waiting, sentRet, 0, sentRet + STICKER_DELETE_START_S) == StickerAction::Delete);
+   EXPECT(stickerDecide(StickerMaintState::Waiting, sentRet, 0, sent + STICKER_DELETE_START_S) == StickerAction::None);
 }
 
 } // namespace
@@ -556,6 +700,9 @@ int main() {
    testVisualQueue();
    testVisualSendDecision();
    testStateMigration();
+   testStickerPolicy();
+   testStickerQueue();
+   testStickerFlow();
 
    printf("\n%d verificacoes, %d falha(s)\n", checks, failures);
 

@@ -699,24 +699,33 @@ bool Telegram::request(
 }
 
 bool Telegram::sendText(const String &message) {
-   return sendMessageInternal(message, nullptr);
+   return sendMessageInternal(message, nullptr, false);
 }
 
 bool Telegram::sendText(const String &message, int32_t &messageId) {
-   return sendMessageInternal(message, &messageId);
+   return sendMessageInternal(message, &messageId, false);
 }
 
-bool Telegram::sendMessageInternal(const String &message, int32_t *outId) {
+bool Telegram::sendText(const String &message, int32_t &messageId, bool disableNotification) {
+   return sendMessageInternal(message, &messageId, disableNotification);
+}
+
+bool Telegram::sendMessageInternal(const String &message, int32_t *outId, bool disableNotification) {
    if (outId != nullptr) {
       *outId = 0;
    }
 
    String response;
 
-   const String query =
+   String query =
       "chat_id=" + urlEncode(TELEGRAM_CHAT_ID) +
       "&text=" + urlEncode(message) +
       "&parse_mode=HTML";
+
+   // The LED state line is posted silently so it never rings the group.
+   if (disableNotification) {
+      query += "&disable_notification=true";
+   }
 
    if (!request("sendMessage", query, response)) {
       return false;
@@ -738,15 +747,21 @@ bool Telegram::sendMessageInternal(const String &message, int32_t *outId) {
 
       // Diagnostic-only: the exact chat the message went to and the id that will later be
       // deleted (chat_id is not the token).
-      Serial.printf("[%lu] TG: sendMessage chat_id=%s result.message_id=%ld\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
-                    static_cast<long>(*outId));
+      Serial.printf("[%lu] TG: sendMessage chat_id=%s result.message_id=%ld silent=%d\n", static_cast<unsigned long>(millis()),
+                    TELEGRAM_CHAT_ID, static_cast<long>(*outId), disableNotification ? 1 : 0);
    }
 
    return true;
 }
 
 bool Telegram::sendSticker(const String &stickerId, int32_t &messageId) {
+   uint32_t dateEpoch = 0;
+   return sendSticker(stickerId, messageId, dateEpoch);
+}
+
+bool Telegram::sendSticker(const String &stickerId, int32_t &messageId, uint32_t &dateEpoch) {
    messageId = 0;
+   dateEpoch = 0;
 
    String response;
 
@@ -770,13 +785,74 @@ bool Telegram::sendSticker(const String &stickerId, int32_t &messageId) {
    }
 
    messageId = doc["result"]["message_id"] | 0;
+   // The API-confirmed send instant (Unix seconds); 0 when the reply carried no date.
+   dateEpoch = doc["result"]["date"] | 0;
 
    // Diagnostic-only: the exact chat the sticker went to and the id that feeds
    // lastFallStickerId / lastReturnStickerId in TelegramNotifier (chat_id is not the token).
-   Serial.printf("[%lu] TG: sendSticker chat_id=%s result.message_id=%ld\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
-                 static_cast<long>(messageId));
+   Serial.printf("[%lu] TG: sendSticker chat_id=%s result.message_id=%ld date=%lu\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
+                 static_cast<long>(messageId), static_cast<unsigned long>(dateEpoch));
 
    return messageId > 0;
+}
+
+Telegram::EditResult Telegram::editMessageText(int32_t messageId, const String &text) {
+   if (messageId <= 0) {
+      // Diagnostic-only: the id handed to the API was not usable, so nothing can be edited.
+      Serial.printf("[%lu] TG: editMessageText id_invalido=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
+      return EditResult::Gone;
+   }
+
+   String response;
+
+   const String query =
+      "chat_id=" + urlEncode(TELEGRAM_CHAT_ID) +
+      "&message_id=" + String(messageId) +
+      "&text=" + urlEncode(text) +
+      "&parse_mode=HTML";
+
+   // Diagnostic-only: the exact target of this edit (chat_id is not the token).
+   Serial.printf("[%lu] TG: editMessageText envio message_id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
+
+   if (!request("editMessageText", query, response)) {
+      // The transport failure was already logged by request().
+      Serial.printf("[%lu] TG: editMessageText transporte_falhou id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
+      return EditResult::Failed;
+   }
+
+   DynamicJsonDocument doc(2048);
+
+   if (deserializeJson(doc, response.substring(response.indexOf("{\"ok\"")))) {
+      Serial.printf("[%lu] TG: editMessageText json_nao_parseavel id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
+      return EditResult::Failed;
+   }
+
+   const bool apiOk = doc["ok"] | false;
+   const int errorCode = doc["error_code"] | 0;
+   const String description = doc["description"] | "";
+
+   Serial.printf("[%lu] TG: editMessageText resposta ok=%d error_code=%d description=\"%s\" id=%ld\n", static_cast<unsigned long>(millis()),
+                 apiOk ? 1 : 0, errorCode, description.c_str(), static_cast<long>(messageId));
+
+   noteApiResult(errorCode, description, doc["parameters"]["retry_after"] | 0);
+
+   if (apiOk) {
+      return EditResult::Edited;
+   }
+
+   // Telegram answers this when the text already IS the substitute: the goal is met.
+   if (errorCode == 400 && description.indexOf("message is not modified") >= 0) {
+      Serial.printf("[%lu] TG: editMessageText ja_editada id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
+      return EditResult::AlreadyText;
+   }
+
+   // The target message no longer exists: there is nothing to edit.
+   if (errorCode == 400 && description.indexOf("message to edit not found") >= 0) {
+      Serial.printf("[%lu] TG: editMessageText ja_inexistente id=%ld\n", static_cast<unsigned long>(millis()), static_cast<long>(messageId));
+      return EditResult::Gone;
+   }
+
+   return EditResult::Failed;
 }
 
 Telegram::DeleteResult Telegram::deleteMessage(int32_t messageId) {

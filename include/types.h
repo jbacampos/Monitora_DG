@@ -168,6 +168,66 @@ struct VisualQueue {
    }
 };
 
+// Sticker maintenance (FALTA / RETORNO): after STICKER_DELETE_START_S the sticker is deleted and,
+// once it is gone, the ORIGINAL text message is simplified with editMessageText. The association
+// sticker <-> text <-> event instant <-> substitute text is kept together so it can never drift.
+constexpr uint8_t STICKER_SHORT_TEXT_MAX = 44; // "🕯️Energia caiu em dd/mm/yyyy hh:mm" + NUL
+
+struct StickerEvent {
+   int32_t stickerId = 0;         // sticker message_id (0 = none / already resolved)
+   int32_t textId = 0;            // associated text message_id (0 = not known yet)
+   uint32_t sentEpoch = 0;        // API-confirmed send instant (Unix seconds; 0 = unknown)
+   uint32_t nextAttemptEpoch = 0; // earliest next attempt (Unix seconds; 0 = no gate)
+   uint8_t state = 0;             // StickerMaintState (see sticker_maint.h)
+   char shortText[STICKER_SHORT_TEXT_MAX] = {0}; // substitute text preserved verbatim
+};
+
+// FIFO of sticker events whose sticker was already deleted (by the maintenance or by DEL_OLD at a
+// new FALTA) but whose text still has to be simplified. Persisted so a pending edit survives a
+// reboot and the association is never lost when a current slot is reused by a newer event.
+constexpr uint8_t STICKER_EDIT_QUEUE_CAP = 6;
+
+struct StickerEditQueue {
+   StickerEvent items[STICKER_EDIT_QUEUE_CAP]{};
+   uint8_t head = 0;     // index of the oldest item
+   uint8_t count = 0;    // number of valid items
+   uint16_t dropped = 0; // diagnostic: jobs coalesced away on overflow (never silent)
+
+   void clear() {
+      head = 0;
+      count = 0;
+      dropped = 0;
+   }
+
+   bool empty() const { return count == 0; }
+
+   StickerEvent *front() { return (count == 0) ? nullptr : &items[head]; }
+
+   // Appends one job. On overflow the OLDEST is coalesced away and false is returned (logged).
+   bool push(const StickerEvent &e) {
+      bool ok = true;
+
+      if (count == STICKER_EDIT_QUEUE_CAP) {
+         pop();
+         ++dropped;
+         ok = false;
+      }
+
+      items[(head + count) % STICKER_EDIT_QUEUE_CAP] = e;
+      ++count;
+      return ok;
+   }
+
+   void pop() {
+      if (count == 0) {
+         return;
+      }
+
+      head = static_cast<uint8_t>((head + 1) % STICKER_EDIT_QUEUE_CAP);
+      --count;
+   }
+};
+
 struct PersistedState {
    bool validReliable = false;
    PowerState power{};
@@ -231,6 +291,15 @@ struct PersistedState {
    // chronological order once no FALTA/RETORNO sequence is in flight. Persisted so a reboot never
    // loses a confirmed transition. Appended at the END to keep every earlier field offset.
    VisualQueue visualQueue{};
+
+   // --- Appended by firmware 1.6.1 (sticker maintenance: delete at 36 h, simplify the text) ---
+   //
+   // One current slot per direction (FALTA / RETORNO), independent of each other, plus a FIFO of
+   // orphaned edits (a sticker already deleted by DEL_OLD while its text still owes the
+   // simplification). Appended at the END to keep every earlier field offset.
+   StickerEvent fallMaint{};
+   StickerEvent returnMaint{};
+   StickerEditQueue editQueue{};
 };
 
 // Reason of a boot/reboot. The CODE is the STABLE value published (as a NUMBER) to ThingsBoard

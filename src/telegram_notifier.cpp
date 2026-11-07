@@ -5,6 +5,7 @@
 #include "config.h"
 #include "secrets.h"
 #include "state_store.h"
+#include "sticker_maint.h"
 #include "telegram.h"
 #include "time_source.h"
 
@@ -340,21 +341,30 @@ void TelegramNotifier::stepDelOld() {
    // can_delete_messages). An outright refusal used to keep the sequence parked in DEL_OLD
    // forever - and with it the getUpdates() poll, so /reboot and /ota went dead while
    // ThingsBoard kept working. A transient failure still keeps the id and the phase.
-   if (!resolveStickerDelete(state_->lastFallStickerId, "DEL_FALL")) {
+   const int32_t fallTarget = state_->lastFallStickerId;
+   bool fallDeleted = false;
+   if (!resolveStickerDelete(state_->lastFallStickerId, "DEL_FALL", &fallDeleted)) {
       return;
    }
+   retireStickerEvent(state_->fallMaint, fallTarget, fallDeleted);
 
-   if (!resolveStickerDelete(state_->lastReturnStickerId, "DEL_RET")) {
+   const int32_t retTarget = state_->lastReturnStickerId;
+   bool retDeleted = false;
+   if (!resolveStickerDelete(state_->lastReturnStickerId, "DEL_RET", &retDeleted)) {
       return;
    }
+   retireStickerEvent(state_->returnMaint, retTarget, retDeleted);
 
    state_->tgPhase = TG_PHASE_SEND_FALL;
    save();
 }
 
-bool TelegramNotifier::resolveStickerDelete(int32_t &id, const char *label) {
+bool TelegramNotifier::resolveStickerDelete(int32_t &id, const char *label, bool *deleted) {
    if (id <= 0) {
       Serial.printf("[%lu] TG: %s skip id=0\n", static_cast<unsigned long>(millis()), label);
+      if (deleted != nullptr) {
+         *deleted = true; // nothing to delete
+      }
       return true;
    }
 
@@ -395,6 +405,12 @@ bool TelegramNotifier::resolveStickerDelete(int32_t &id, const char *label) {
                     static_cast<long>(target));
    }
 
+   // The sticker is actually gone only when Telegram deleted it or reported it already missing;
+   // a permanent refusal leaves it in the chat.
+   if (deleted != nullptr) {
+      *deleted = (result != Telegram::DeleteResult::Impossible);
+   }
+
    id = 0;
    save();
    return true;
@@ -402,12 +418,13 @@ bool TelegramNotifier::resolveStickerDelete(int32_t &id, const char *label) {
 
 void TelegramNotifier::stepSendFall() {
    int32_t messageId = 0;
+   uint32_t dateEpoch = 0;
 
    const uint32_t tSend = millis();
 
    Serial.printf("[%lu] TG: SEND_FALL inicio\n", static_cast<unsigned long>(tSend));
 
-   const bool ok = telegram_->sendSticker(TELEGRAM_OLI_STICKER, messageId);
+   const bool ok = telegram_->sendSticker(TELEGRAM_OLI_STICKER, messageId, dateEpoch);
 
    Serial.printf("[%lu] TG: SEND_FALL resultado=%s message_id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
                  static_cast<long>(messageId), static_cast<unsigned long>(millis() - tSend));
@@ -418,6 +435,14 @@ void TelegramNotifier::stepSendFall() {
 
    state_->lastFallStickerId = messageId;
    state_->lastReturnStickerId = 0;
+
+   // A new FALTA event starts its own maintenance cycle from the API-confirmed send instant.
+   // DEL_OLD already retired the previous slots into the edit queue, so these slots are free.
+   state_->fallMaint = StickerEvent{};
+   state_->fallMaint.stickerId = messageId;
+   state_->fallMaint.sentEpoch = dateEpoch;
+   state_->fallMaint.state = static_cast<uint8_t>(StickerMaintState::Waiting);
+
    state_->tgPhase = TG_PHASE_TEXT_FALL;
    save();
 }
@@ -427,26 +452,32 @@ void TelegramNotifier::stepTextFall() {
 
    Serial.printf("[%lu] TG: TEXT_FALL inicio\n", static_cast<unsigned long>(tText));
 
-   const bool ok = telegram_->sendText(buildMessage(false));
+   int32_t textId = 0;
+   const bool ok = telegram_->sendText(buildMessage(false), textId);
 
-   Serial.printf("[%lu] TG: TEXT_FALL resultado=%s duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
-                 static_cast<unsigned long>(millis() - tText));
+   Serial.printf("[%lu] TG: TEXT_FALL resultado=%s message_id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
+                 static_cast<long>(textId), static_cast<unsigned long>(millis() - tText));
 
    if (!ok) {
       return;
    }
+
+   // Record the association so the text can be simplified once the sticker is deleted.
+   state_->fallMaint.textId = textId;
+   snprintf(state_->fallMaint.shortText, sizeof(state_->fallMaint.shortText), "%s", buildShortText(false).c_str());
 
    finishSequence(false);
 }
 
 void TelegramNotifier::stepSendRet() {
    int32_t messageId = 0;
+   uint32_t dateEpoch = 0;
 
    const uint32_t tSend = millis();
 
    Serial.printf("[%lu] TG: SEND_RET inicio\n", static_cast<unsigned long>(tSend));
 
-   const bool ok = telegram_->sendSticker(TELEGRAM_HUNO_STICKER, messageId);
+   const bool ok = telegram_->sendSticker(TELEGRAM_HUNO_STICKER, messageId, dateEpoch);
 
    Serial.printf("[%lu] TG: SEND_RET resultado=%s message_id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
                  static_cast<long>(messageId), static_cast<unsigned long>(millis() - tSend));
@@ -456,6 +487,13 @@ void TelegramNotifier::stepSendRet() {
    }
 
    state_->lastReturnStickerId = messageId;
+
+   // A new RETORNO event starts its own maintenance cycle (the FALTA slot is preserved).
+   state_->returnMaint = StickerEvent{};
+   state_->returnMaint.stickerId = messageId;
+   state_->returnMaint.sentEpoch = dateEpoch;
+   state_->returnMaint.state = static_cast<uint8_t>(StickerMaintState::Waiting);
+
    state_->tgPhase = TG_PHASE_TEXT_RET;
    save();
 }
@@ -465,14 +503,19 @@ void TelegramNotifier::stepTextRet() {
 
    Serial.printf("[%lu] TG: TEXT_RET inicio\n", static_cast<unsigned long>(tText));
 
-   const bool ok = telegram_->sendText(buildMessage(true));
+   int32_t textId = 0;
+   const bool ok = telegram_->sendText(buildMessage(true), textId);
 
-   Serial.printf("[%lu] TG: TEXT_RET resultado=%s duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
-                 static_cast<unsigned long>(millis() - tText));
+   Serial.printf("[%lu] TG: TEXT_RET resultado=%s message_id=%ld duracao=%lums\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
+                 static_cast<long>(textId), static_cast<unsigned long>(millis() - tText));
 
    if (!ok) {
       return;
    }
+
+   // Record the association so the text can be simplified once the sticker is deleted.
+   state_->returnMaint.textId = textId;
+   snprintf(state_->returnMaint.shortText, sizeof(state_->returnMaint.shortText), "%s", buildShortText(true).c_str());
 
    finishSequence(true);
 }
@@ -494,6 +537,44 @@ String TelegramNotifier::buildMessage(bool returnOfEnergy) const {
 
    char buffer[320];
    snprintf(buffer, sizeof(buffer), "O %s Sr. %s %s:\n%s %s %s\n%s %s", adjective, person, verb, emoji, text, emoji, EMOJI_CLOCK, when);
+
+   return String(buffer);
+}
+
+void TelegramNotifier::retireStickerEvent(StickerEvent &slot, int32_t targetId, bool deleted) {
+   const bool matches = (targetId > 0 && slot.stickerId == targetId);
+   const bool editOwed = (slot.textId > 0 && slot.state != static_cast<uint8_t>(StickerMaintState::Done) &&
+                          slot.state != static_cast<uint8_t>(StickerMaintState::None));
+
+   // Keep the association before the slot is reused: a slot already awaiting its edit, or a
+   // sticker DEL_OLD just removed, moves into the persisted edit queue. A sticker Telegram refused
+   // to delete (still present in the chat) is NOT simplified.
+   if (editOwed && (slot.state == static_cast<uint8_t>(StickerMaintState::EditPending) || (deleted && matches))) {
+      StickerEvent job = slot;
+      job.stickerId = 0;
+      job.state = static_cast<uint8_t>(StickerMaintState::EditPending);
+      job.nextAttemptEpoch = 0;
+
+      if (!state_->editQueue.push(job)) {
+         Serial.printf("[%lu] TG: fila de edicoes cheia; edicao mais antiga coalescida (dropped=%u)\n", static_cast<unsigned long>(millis()),
+                       static_cast<unsigned>(state_->editQueue.dropped));
+      }
+   }
+
+   slot = StickerEvent{};
+}
+
+String TelegramNotifier::buildShortText(bool returnOfEnergy) const {
+   char when[40];
+
+   if (state_->tgTimestamp.kind == TsKind::Epoch) {
+      TimeSource::formatBrasilia(state_->tgTimestamp.value, when, sizeof(when));
+   } else {
+      snprintf(when, sizeof(when), "horário desconhecido");
+   }
+
+   char buffer[STICKER_SHORT_TEXT_MAX];
+   snprintf(buffer, sizeof(buffer), "%sEnergia %s em %s", returnOfEnergy ? EMOJI_RETURN : EMOJI_FALL, returnOfEnergy ? "retornou" : "caiu", when);
 
    return String(buffer);
 }

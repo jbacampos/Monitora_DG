@@ -7,6 +7,7 @@
 #include "ota.h"
 #include "secrets.h"
 #include "state_store.h"
+#include "sticker_maint.h"
 #include "tb_queue.h"
 #include "telegram.h"
 #include "telegram_notifier.h"
@@ -692,7 +693,8 @@ namespace {
 
       int32_t messageId = 0;
 
-      if (telegram.sendText(visualLine(line), messageId) && messageId > 0) {
+      // The LED state line is ALWAYS posted silently: it must never ring the group.
+      if (telegram.sendText(visualLine(line), messageId, true) && messageId > 0) {
          telegramRetryClear();
 
          const int32_t previousId = persisted.lastVisualMessageId;
@@ -736,6 +738,160 @@ namespace {
       } else {
          // Transient: the queued snapshots are KEPT and retried later (never discarded here).
          telegramRetrySchedule("LEDs");
+      }
+   }
+
+   // Absolute Unix time (seconds); 0 when no absolute clock exists yet (the maintenance windows
+   // are absolute-time based, so it simply waits for NTP).
+   uint32_t absoluteNow() {
+      if (timeSource.synced()) {
+         return timeSource.now().value;
+      }
+
+      return 0;
+   }
+
+   // Attempts the text simplification of one sticker event (a current slot or a queued job).
+   // Returns true when it acted.
+   bool stickerAttemptEdit(StickerEvent &job, uint32_t nowEpoch) {
+      if (job.textId <= 0) {
+         job.state = static_cast<uint8_t>(StickerMaintState::Done); // nothing to edit
+         return true;
+      }
+
+      const Telegram::EditResult r = telegram.editMessageText(job.textId, String(job.shortText));
+
+      if (r != Telegram::EditResult::Failed) {
+         // Edited / already carries the substitute text / nothing to edit: done.
+         job.state = static_cast<uint8_t>(StickerMaintState::Done);
+         job.nextAttemptEpoch = 0;
+
+         Serial.printf("[%lu] TG: sticker: texto simplificado id=%ld resultado=%d\n", static_cast<unsigned long>(millis()),
+                       static_cast<long>(job.textId), static_cast<int>(r));
+         return true;
+      }
+
+      // Transient: retry in STICKER_RETRY_S, never before the API asks.
+      uint32_t wait = STICKER_RETRY_S;
+
+      if (telegram.lastRetryAfterSeconds() > wait) {
+         wait = telegram.lastRetryAfterSeconds();
+      }
+
+      job.nextAttemptEpoch = nowEpoch + wait;
+
+      Serial.printf("[%lu] TG: sticker: edicao falhou (transitorio); nova tentativa em %us\n", static_cast<unsigned long>(millis()),
+                    static_cast<unsigned>(wait));
+      return true;
+   }
+
+   // One delete-or-edit step for a current FALTA/RETORNO slot. Returns true when it acted.
+   bool stickerSlotStep(StickerEvent &slot, const char *label, uint32_t nowEpoch) {
+      const StickerAction action = stickerDecide(static_cast<StickerMaintState>(slot.state), slot.sentEpoch, slot.nextAttemptEpoch, nowEpoch);
+
+      if (action == StickerAction::None) {
+         return false;
+      }
+
+      if (action == StickerAction::GiveUp) {
+         slot.state = static_cast<uint8_t>(StickerMaintState::Expired);
+         Serial.printf("[%lu] TG: %s: janela de 48h vencida sem exclusao do sticker; desistindo\n", static_cast<unsigned long>(millis()), label);
+         return true;
+      }
+
+      if (action == StickerAction::Edit) {
+         return stickerAttemptEdit(slot, nowEpoch);
+      }
+
+      // Delete the sticker (the 36 h window is open).
+      slot.state = static_cast<uint8_t>(StickerMaintState::DeletePending);
+
+      if (slot.stickerId <= 0) {
+         // Nothing to delete: the text simplification is owed.
+         slot.state = static_cast<uint8_t>(StickerMaintState::EditPending);
+         slot.nextAttemptEpoch = 0;
+         return true;
+      }
+
+      const Telegram::DeleteResult r = telegram.deleteMessage(slot.stickerId);
+
+      if (r == Telegram::DeleteResult::Failed) {
+         uint32_t wait = STICKER_RETRY_S;
+
+         if (telegram.lastRetryAfterSeconds() > wait) {
+            wait = telegram.lastRetryAfterSeconds();
+         }
+
+         slot.nextAttemptEpoch = nowEpoch + wait;
+
+         Serial.printf("[%lu] TG: %s: exclusao falhou (transitorio); nova tentativa em %us\n", static_cast<unsigned long>(millis()), label,
+                       static_cast<unsigned>(wait));
+         return true;
+      }
+
+      if (r == Telegram::DeleteResult::Impossible) {
+         // Telegram will never delete it: the sticker stays and its text is NOT simplified.
+         slot.state = static_cast<uint8_t>(StickerMaintState::Expired);
+         slot.stickerId = 0;
+         slot.nextAttemptEpoch = 0;
+
+         Serial.printf("[%lu] TG: %s: exclusao impossivel; sticker permanece (sem simplificacao do texto)\n",
+                       static_cast<unsigned long>(millis()), label);
+         return true;
+      }
+
+      // Deleted / NotFound: the sticker is gone and the text simplification is owed.
+      slot.state = static_cast<uint8_t>(StickerMaintState::EditPending);
+      slot.stickerId = 0;
+      slot.nextAttemptEpoch = 0;
+
+      Serial.printf("[%lu] TG: %s: sticker resolvido; edicao do texto pendente\n", static_cast<unsigned long>(millis()), label);
+      return true;
+   }
+
+   // Sticker maintenance: deletes the FALTA/RETORNO stickers at 36 h and simplifies the associated
+   // texts once a sticker is gone. Runs at most one action per pass, only when no FALTA/RETORNO
+   // sequence is in flight and Telegram is free, so it never blocks the FIFO line, ThingsBoard,
+   // /reboot, /ota or new transitions.
+   void serviceStickerMaint() {
+      if (WiFi.status() != WL_CONNECTED) {
+         return;
+      }
+
+      if (persisted.tgPhase != TG_PHASE_NONE) {
+         return;
+      }
+
+      if (telegramRetryWaiting()) {
+         return; // a send is backing off; do not add requests
+      }
+
+      const uint32_t nowEpoch = absoluteNow();
+
+      if (nowEpoch == 0) {
+         return; // the windows need absolute time
+      }
+
+      bool acted = false;
+
+      if (stickerSlotStep(persisted.fallMaint, "FALTA", nowEpoch)) {
+         acted = true;
+      } else if (stickerSlotStep(persisted.returnMaint, "RETORNO", nowEpoch)) {
+         acted = true;
+      } else {
+         StickerEvent *job = persisted.editQueue.front();
+
+         if (job != nullptr && stickerAttemptEdit(*job, nowEpoch)) {
+            if (job->state == static_cast<uint8_t>(StickerMaintState::Done)) {
+               persisted.editQueue.pop();
+            }
+
+            acted = true;
+         }
+      }
+
+      if (acted) {
+         saveState();
       }
    }
 
@@ -914,14 +1070,15 @@ namespace {
                     static_cast<unsigned long>(telegram.reuseStalls()), static_cast<unsigned long>(telegram.newConnections()));
 
       Serial.printf("DIAG up=%lus wifi=%d rssi=%d ntp=%d rede=%d pend=%lu head=%lu gap=%u tgPend=%d tgNotif=%d tgForce=%d tgPhase=%s tgStuck=%d "
-                    "fallId=%ld retId=%ld visId=%ld visDelId=%ld vq=%u vqDrop=%u\n",
+                    "fallId=%ld retId=%ld visId=%ld visDelId=%ld vq=%u vqDrop=%u fallM=%d retM=%d eq=%u eqDrop=%u\n",
                     static_cast<unsigned long>(now / 1000UL), WiFi.status() == WL_CONNECTED ? 1 : 0, WiFi.RSSI(), timeSource.synced() ? 1 : 0,
                     persisted.power.redeDisponivel ? 1 : 0, static_cast<unsigned long>(count - persisted.tbLogHead),
                     static_cast<unsigned long>(persisted.tbLogHead), persisted.tbGapCount, persisted.tgPending ? 1 : 0, persisted.tgNotifiedRede ? 1 : 0,
                     persisted.tgForceNotify ? 1 : 0, phaseName(persisted.tgPhase), tgPhaseStuck ? 1 : 0, static_cast<long>(persisted.lastFallStickerId),
                     static_cast<long>(persisted.lastReturnStickerId), static_cast<long>(persisted.lastVisualMessageId),
                     static_cast<long>(persisted.visualDeletePendingId), static_cast<unsigned>(persisted.visualQueue.count),
-                    static_cast<unsigned>(persisted.visualQueue.dropped));
+                    static_cast<unsigned>(persisted.visualQueue.dropped), persisted.fallMaint.state, persisted.returnMaint.state,
+                    static_cast<unsigned>(persisted.editQueue.count), static_cast<unsigned>(persisted.editQueue.dropped));
 
       Serial.printf("[%lu] BOOT DIAG: bootId=%ld bootDelId=%ld reason=%s\n", static_cast<unsigned long>(now),
                     static_cast<long>(persisted.lastBootMessageId), static_cast<long>(persisted.bootDeletePendingId),
@@ -1080,6 +1237,10 @@ void loop() {
 
    // Visual state line: after the boot text and after any accepted change of the signals.
    serviceVisualNotice();
+
+   // Sticker maintenance: delete the FALTA/RETORNO stickers at 36 h and simplify the associated
+   // texts. Independent of the visual line, which is never deleted.
+   serviceStickerMaint();
 
    const uint32_t afterTg = millis();
 

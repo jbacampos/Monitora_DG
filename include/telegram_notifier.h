@@ -67,15 +67,23 @@ private:
    void abortSequence(const char *reason);
 
    void stepDelOld();
-   // Resolves one persisted sticker id: true when it no longer blocks (deleted, already
-   // gone or permanently refused); false only for a transient failure.
-   bool resolveStickerDelete(int32_t &id, const char *label);
+   // Resolves one persisted sticker id: true when it no longer blocks (deleted, already gone or
+   // permanently refused); false only for a transient failure. `deleted` (optional) reports
+   // whether the sticker is actually GONE (deleted or already missing) as opposed to refused.
+   bool resolveStickerDelete(int32_t &id, const char *label, bool *deleted = nullptr);
    void stepSendFall();
    void stepTextFall();
    void stepSendRet();
    void stepTextRet();
 
+   // Moves a slot's still-owed text edit into the persisted edit queue (the slot is about to be
+   // reused by a newer event) and clears the slot. Never loses the sticker<->text association.
+   void retireStickerEvent(StickerEvent &slot, int32_t targetId, bool deleted);
+
    String buildMessage(bool returnOfEnergy) const;
+   // Substitute text of the event currently held in state_->tgTimestamp (original instant, never
+   // the edit instant): "<emoji>Energia caiu/retornou em dd/mm/yyyy hh:mm".
+   String buildShortText(bool returnOfEnergy) const;
 
    int nextIndex(int *order, size_t count, size_t &position);
    void shuffle(int *order, size_t count);

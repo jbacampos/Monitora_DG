@@ -31,7 +31,23 @@ public:
    // replace (delete) the previous visual message. Returns the API ok flag; messageId is
    // set to 0 when the reply carried no id.
    bool sendText(const String &message, int32_t &messageId);
+   // sendMessage() variant that can post silently (disable_notification=true). Used only by the
+   // LED state line, which must never ring.
+   bool sendText(const String &message, int32_t &messageId, bool disableNotification);
    bool sendSticker(const String &stickerId, int32_t &messageId);
+   // Variant that also reports the API-confirmed send instant (Unix seconds; 0 when the reply
+   // carried no date). Used to start a sticker's maintenance window.
+   bool sendSticker(const String &stickerId, int32_t &messageId, uint32_t &dateEpoch);
+
+   // Verdict of editMessageText().
+   enum class EditResult : uint8_t {
+      Edited,      // {"ok":true}: the substitute text is in place
+      AlreadyText, // "message is not modified": it already carries the substitute text
+      Gone,        // "message to edit not found": there is nothing to edit
+      Failed       // transient (transport, 5xx, 429, unconfirmed reply): retry later
+   };
+   // Replaces the text of an existing message, keeping its message_id (never sends a new message).
+   EditResult editMessageText(int32_t messageId, const String &text);
 
    // Returns Deleted/NotFound when the id no longer refers to a live message,
    // Impossible when Telegram will never accept the deletion and Failed when the
@@ -86,7 +102,7 @@ private:
 
    // Shared sendMessage() implementation. When outId is non-null it receives the
    // message_id from the Telegram reply (0 when the reply carried no id).
-   bool sendMessageInternal(const String &message, int32_t *outId);
+   bool sendMessageInternal(const String &message, int32_t *outId, bool disableNotification);
 
    void processUpdates(const String &response);
 

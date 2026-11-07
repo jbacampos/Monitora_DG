@@ -7,7 +7,9 @@ Campos do `DIAG`: `up` (uptime s), `wifi`, `rssi`, `ntp`, `rede`, `pend` (n pend
 `head`, `gap` (tbGapCount), `tgPend`, `tgNotif`, `tgForce`, `tgPhase`, `tgStuck` (fase sem
 progresso ha mais de `TELEGRAM_PHASE_STUCK_MS`), `fallId`, `retId`,
 `visId` (id da atual mensagem visual), `visDelId` (id aguardando exclusao, 0 = nenhum),
-`vq` (fotografias na fila visual), `vqDrop` (coalescidas por overflow).
+`vq` (fotografias na fila visual), `vqDrop` (coalescidas por overflow), `fallM`/`retM` (estado da
+manutencao do sticker FALTA/RETORNO: 0=none 1=waiting 2=delete 3=edit 4=done 5=expired),
+`eq` (edicoes pendentes na fila), `eqDrop` (coalescidas por overflow).
 Na linha `BOOT DIAG` adicional: `bootId` (id da atual mensagem de reinicio), `bootDelId` (id de
 reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da mensagem).
 
@@ -102,6 +104,35 @@ reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da
 7. Reboot com transicoes na fila: apos o boot elas sao enviadas em ordem; `vq` volta a 0.
 8. Reboot com `visDelId` != 0: a exclusao pendente e retomada apos o boot, antes de enviar a linha
    de boot.
+
+## N. Manutencao dos stickers FALTA/RETORNO (36 h -> exclusao + simplificacao)
+
+1. Bot administrador. Gere FALTA e depois RETORNO. Confirme no Serial o `date` confirmado pela API
+   em `sendSticker` (`result.message_id=... date=...`) e `DIAG ... fallM=1 retM=1` (waiting).
+2. Antes de 36 h: `fallM`/`retM` permanecem 1 e nenhum `deleteMessage` e enviado.
+3. Ao completar 36 h (ajuste o relogio do equipamento ou aguarde): `deleteMessage` do sticker;
+   `fallM`/`retM` -> 2 (delete) e, com sucesso, -> 3 (edit). O sticker some do grupo; o texto fica.
+4. Em seguida: `editMessageText` substitui o texto por `🕯️Energia caiu em <data>` /
+   `💡Energia retornou em <data>` (mesma data/hora do evento original, nunca a da edicao).
+   Serial `editMessageText resposta ok=1`; `fallM`/`retM` -> 4 (done).
+5. Falha transitoria na exclusao (rede): `fallM`/`retM` permanecem 2, nova tentativa +15 min; nenhuma
+   requisicao antes disso. Ao restaurar, a exclusao e confirmada.
+6. HTTP 429 com `retry_after`: a proxima tentativa respeita o prazo (`nova tentativa em <retry_after>s`).
+7. Falha na edicao apos a exclusao confirmada: `fallM`/`retM` -> 3; a pendencia persiste e e retomada
+   a cada 15 min (inclusive apos reboot). Nenhum novo `deleteMessage`.
+8. Reboot com `fallM`/`retM` = 2 ou 3: a manutencao retoma apos o boot, respeitando o proximo
+   instante persistido.
+9. Janela de 48 h vencida sem exclusao: Serial `janela de 48h vencida sem exclusao do sticker;
+   desistindo`; `fallM`/`retM` -> 5 (expired); o sticker permanece (ver teste S1).
+10. Edicao pendente apos 48 h: continua sendo tentada (`stickerDecide` ignora o limite para
+    EditPending).
+11. Nova FALTA antes das 36 h: `DEL_OLD` apaga os stickers do ciclo anterior e a simplificacao dos
+    textos correspondentes vai para a fila persistida (`eq` > 0), processada em seguida — nenhuma
+    associacao sticker<->texto e perdida.
+12. Linha visual: confirmar que TODOS os envios (`sendMessage ... silent=1`) usam
+    `disable_notification=true` e que a manutencao NUNCA apaga nem reenvia a linha visual.
+13. `/reboot` e `/ota` continuam respondendo durante a manutencao; a fila visual FIFO permanece
+    intacta (`vq`/`vqDrop`).
 
 ## Testes de logica no host (sem hardware)
 
