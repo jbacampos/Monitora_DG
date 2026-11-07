@@ -699,24 +699,37 @@ bool Telegram::request(
 }
 
 bool Telegram::sendText(const String &message) {
-   return sendMessageInternal(message, nullptr);
+   return sendMessageInternal(message, nullptr, nullptr, false);
 }
 
 bool Telegram::sendText(const String &message, int32_t &messageId) {
-   return sendMessageInternal(message, &messageId);
+   return sendMessageInternal(message, &messageId, nullptr, false);
 }
 
-bool Telegram::sendMessageInternal(const String &message, int32_t *outId) {
+bool Telegram::sendText(const String &message, int32_t &messageId, uint32_t &dateEpoch, bool disableNotification) {
+   return sendMessageInternal(message, &messageId, &dateEpoch, disableNotification);
+}
+
+bool Telegram::sendMessageInternal(const String &message, int32_t *outId, uint32_t *outDate, bool disableNotification) {
    if (outId != nullptr) {
       *outId = 0;
    }
 
+   if (outDate != nullptr) {
+      *outDate = 0;
+   }
+
    String response;
 
-   const String query =
+   String query =
       "chat_id=" + urlEncode(TELEGRAM_CHAT_ID) +
       "&text=" + urlEncode(message) +
       "&parse_mode=HTML";
+
+   // Silent posting is used only by the preventive renewal of the visual line.
+   if (disableNotification) {
+      query += "&disable_notification=true";
+   }
 
    if (!request("sendMessage", query, response)) {
       return false;
@@ -735,18 +748,31 @@ bool Telegram::sendMessageInternal(const String &message, int32_t *outId) {
 
    if (outId != nullptr) {
       *outId = doc["result"]["message_id"] | 0;
+   }
 
+   if (outDate != nullptr) {
+      // The API-confirmed send instant (Unix seconds); 0 when the reply carried no date.
+      *outDate = doc["result"]["date"] | 0;
+   }
+
+   if (outId != nullptr) {
       // Diagnostic-only: the exact chat the message went to and the id that will later be
       // deleted (chat_id is not the token).
-      Serial.printf("[%lu] TG: sendMessage chat_id=%s result.message_id=%ld\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
-                    static_cast<long>(*outId));
+      Serial.printf("[%lu] TG: sendMessage chat_id=%s result.message_id=%ld silent=%d\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
+                    static_cast<long>(*outId), disableNotification ? 1 : 0);
    }
 
    return true;
 }
 
 bool Telegram::sendSticker(const String &stickerId, int32_t &messageId) {
+   uint32_t dateEpoch = 0;
+   return sendSticker(stickerId, messageId, dateEpoch);
+}
+
+bool Telegram::sendSticker(const String &stickerId, int32_t &messageId, uint32_t &dateEpoch) {
    messageId = 0;
+   dateEpoch = 0;
 
    String response;
 
@@ -770,11 +796,12 @@ bool Telegram::sendSticker(const String &stickerId, int32_t &messageId) {
    }
 
    messageId = doc["result"]["message_id"] | 0;
+   dateEpoch = doc["result"]["date"] | 0;
 
    // Diagnostic-only: the exact chat the sticker went to and the id that feeds
    // lastFallStickerId / lastReturnStickerId in TelegramNotifier (chat_id is not the token).
-   Serial.printf("[%lu] TG: sendSticker chat_id=%s result.message_id=%ld\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
-                 static_cast<long>(messageId));
+   Serial.printf("[%lu] TG: sendSticker chat_id=%s result.message_id=%ld date=%lu\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
+                 static_cast<long>(messageId), static_cast<unsigned long>(dateEpoch));
 
    return messageId > 0;
 }

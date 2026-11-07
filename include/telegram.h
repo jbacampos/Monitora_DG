@@ -31,7 +31,13 @@ public:
    // replace (delete) the previous visual message. Returns the API ok flag; messageId is
    // set to 0 when the reply carried no id.
    bool sendText(const String &message, int32_t &messageId);
+   // Variant that also reports the API-CONFIRMED send instant (Unix seconds; 0 when the reply
+   // carried no date) and can post silently (disable_notification=true), used only by the
+   // preventive renewal of the visual line.
+   bool sendText(const String &message, int32_t &messageId, uint32_t &dateEpoch, bool disableNotification);
    bool sendSticker(const String &stickerId, int32_t &messageId);
+   // Variant that also reports the API-confirmed send instant (Unix seconds).
+   bool sendSticker(const String &stickerId, int32_t &messageId, uint32_t &dateEpoch);
 
    // Returns Deleted/NotFound when the id no longer refers to a live message,
    // Impossible when Telegram will never accept the deletion and Failed when the
@@ -85,8 +91,9 @@ private:
    );
 
    // Shared sendMessage() implementation. When outId is non-null it receives the
-   // message_id from the Telegram reply (0 when the reply carried no id).
-   bool sendMessageInternal(const String &message, int32_t *outId);
+   // message_id from the Telegram reply (0 when the reply carried no id); when outDate is
+   // non-null it receives the API-confirmed send instant in Unix seconds.
+   bool sendMessageInternal(const String &message, int32_t *outId, uint32_t *outDate, bool disableNotification);
 
    void processUpdates(const String &response);
 

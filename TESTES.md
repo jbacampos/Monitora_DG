@@ -6,7 +6,10 @@ pelo ThingsBoard (telemetria/atributos) e pelo Telegram.
 Campos do `DIAG`: `up` (uptime s), `wifi`, `rssi`, `ntp`, `rede`, `pend` (n pendentes TB),
 `head`, `gap` (tbGapCount), `tgPend`, `tgNotif`, `tgForce`, `tgPhase`, `tgStuck` (fase sem
 progresso ha mais de `TELEGRAM_PHASE_STUCK_MS`), `fallId`, `retId`,
-`visId` (id da atual mensagem visual), `visDelId` (id aguardando exclusao, 0 = nenhum).
+`visId` (id da atual mensagem visual), `visDelId` (id aguardando exclusao, 0 = nenhum),
+`vq` (fotografias na fila visual), `vqDrop` (coalescidas por overflow), `renew` (renovacao
+silenciosa pendente), `fallM`/`retM`/`visM` (estado da exclusao preventiva: 0=none 1=waiting
+2=done 3=expired).
 Na linha `BOOT DIAG` adicional: `bootId` (id da atual mensagem de reinicio), `bootDelId` (id de
 reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da mensagem).
 
@@ -81,21 +84,26 @@ reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da
 - Sem Wi-Fi: GPIO continua; transicoes continuam persistidas (`pend` cresce); ao voltar
   o Wi-Fi os eventos sao publicados.
 
-## L. Estado visual (4 LEDs) - substituicao de mensagem
+## L. Estado visual (4 LEDs) - fila de transicoes e substituicao
 
-1. Boot: apos o texto de boot, e enviada a linha visual. Se havia uma linha do boot
-   anterior, ela e apagada (existe sempre **uma** so).
-2. Provocar uma mudanca dos 4 sinais: nova linha enviada; a anterior apagada. Confirmar
-   `visId` atualizado e `visDelId` = 0 apos a exclusao.
-3. Mudanca rapida (offgrid ON -> ambos OFF -> gerador ON): coalescing de 3 s => uma unica
-   linha com o estado final.
-4. Durante FALTA/RETORNO (`tgPhase != NONE`): nenhuma linha visual e inserida.
-5. Forcar falha de `deleteMessage()` da linha visual: `visDelId` permanece != 0; nenhuma
-   nova linha visual e enviada enquanto pendente; mudancas continuam coalescidas. Ao
-   restaurar a rede, a exclusao e confirmada (`visDelId` = 0) e a linha atual pendente e
-   enviada.
-6. Reboot com `visDelId` != 0: a exclusao pendente e retomada apos o boot, antes de enviar
-   a nova linha visual de boot.
+1. Boot: apos o texto de boot, e enviada a linha visual (a fila persistida traz as transicoes
+   confirmadas antes do reboot, seguidas do estado atual). Se havia uma linha do boot anterior,
+   ela e apagada (existe sempre **uma** so).
+2. Provocar uma mudanca dos 4 sinais: a transicao e enfileirada e a nova linha e enviada; a
+   anterior apagada. Confirmar `visId` atualizado e `visDelId` = 0 apos a exclusao.
+3. **FALTA -> RETORNO rapido (o caso de 05/11)**: as duas fotografias ficam na fila e sao enviadas
+   em ordem (a de queda e depois a de retorno) assim que `tgPhase` volta a `none`. Confirmar `vq`
+   decrementando de 2 ate 0 e **duas** linhas no grupo; nenhuma e descartada por o estado final
+   coincidir com o anterior.
+4. Mudanca real durante uma sequencia textual (`tgPhase != NONE`): a transicao e enfileirada e
+   enviada ao final; a sequencia **adia**, nao descarta.
+5. Uma queda dentro da janela de graca **nao** entra na fila (so a FALTA confirmada).
+6. Forcar falha **transitoria** de `deleteMessage()` da linha visual: `visDelId` permanece != 0;
+   nenhuma nova linha e enviada enquanto pendente; ao restaurar, a exclusao e confirmada e a linha
+   pendente e enviada. (Recusa permanente — 48 h/sem direito: ver teste S1, o id e descartado.)
+7. Reboot com transicoes na fila: apos o boot elas sao enviadas em ordem; `vq` volta a 0.
+8. Reboot com `visDelId` != 0: a exclusao pendente e retomada apos o boot, antes de enviar a linha
+   de boot.
 
 ## Testes de logica no host (sem hardware)
 

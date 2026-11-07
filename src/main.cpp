@@ -11,6 +11,7 @@
 #include "telegram.h"
 #include "telegram_notifier.h"
 #include "telemetry.h"
+#include "tg_maint.h"
 #include "time_source.h"
 #include "types.h"
 #include "wifi_manager.h"
@@ -39,31 +40,26 @@ namespace {
    // ---------------------------------------------------------------------------
    // Visual state notice: one Telegram line with the four LEDs.
    //
-   // The flags below are RAM only (never persisted), but the id of the current visual
-   // message IS persisted (PersistedState::lastVisualMessageId / visualDeletePendingId) so a
-   // new boot line can replace the previous one. visualPending is armed by a change of any of
-   // the four signals and by the boot notice, and cleared only after the line was delivered
-   // (or when the settled state is already the last one reported). Change driven lines never
-   // represent a provisional redeDisponivel fall and only go out after the state has been
-   // stable for VISUAL_NOTICE_GRACE_MS: see serviceVisualNotice().
+   // Every CONFIRMED electrical transition is pushed onto a persisted FIFO (visualQueue) with the
+   // state captured at the transition instant, and the line is sent in chronological order once no
+   // FALTA/RETORNO sequence is in flight. A burst of transitions (a FALTA followed by a RETORNO)
+   // is therefore never lost: the text sequence DEFERS the sends, it does not discard them. The id
+   // of the current line is persisted (lastVisualMessageId / visualDeletePendingId) so a new line
+   // can replace the previous one.
    // ---------------------------------------------------------------------------
 
-   // Stability window for the visual line. Every change that arms visualPending restarts
-   // it, so a fast sequence (offgrid ON -> both OFF -> gerador ON) coalesces into a single
-   // line carrying the final state: no intermediate situation is ever sent. The boot line
-   // is exempt and goes out immediately after the boot text.
-   constexpr uint32_t VISUAL_NOTICE_GRACE_MS = 3000UL;
-
-   bool visualPending = false;
-   bool visualBootPending = false; // boot line: immediate, ignores the stability window
-   uint32_t visualArmedMillis = 0;
    bool bootTextSent = false;
-   // RAM only: the API refused the boot notice with an error no retry can fix (bad token, chat
-   // not found, bot without rights). Nothing else is attempted this boot, so a dead bot cannot
-   // turn the loop into a permanent request storm; any later transition arms it again.
+   // RAM only: the API refused the boot notice with an error no retry can fix (bad token, chat not
+   // found, bot without rights). Nothing else is attempted this boot, so a dead bot cannot turn the
+   // loop into a permanent request storm; any later transition re-arms it.
    bool bootNoticeAbandoned = false;
+   // RAM only: the state of the last line actually sent THIS session. Used solely to avoid
+   // enqueuing a duplicate when no transition happened (never to suppress a queued transition).
    bool visualStateKnown = false;
    PowerState lastVisualState{};
+
+   // Defined after saveState(); declared here because the transition/grace paths enqueue snapshots.
+   void enqueueVisual(const PowerState &s);
 
    constexpr char LED_REDE_ON[] = "\xF0\x9F\x9F\xA2";      // 🟢 rede disponivel
    constexpr char LED_ALIM_REDE_ON[] = "\xF0\x9F\x94\xB5"; // 🔵 alimentacao pela rede
@@ -88,6 +84,24 @@ namespace {
          // exactly the kind of failure that breaks cross-reboot retention.
          Serial.printf("[%lu] AVISO: falha ao gravar state.bin\n", static_cast<unsigned long>(millis()));
       }
+   }
+
+   // Queues one confirmed electrical transition for the Telegram visual line. `s` is the state AT
+   // the transition instant (captured by the caller), so the line reflects that instant and not the
+   // state at the moment it is finally sent. Persisted, so a reboot never loses a confirmed
+   // transition. The only suppression is a duplicate with the last line sent when NOTHING is
+   // pending: a confirmed change that returns to a previous value is still queued.
+   void enqueueVisual(const PowerState &s) {
+      if (persisted.visualQueue.empty() && visualStateKnown && samePowerState(s, lastVisualState)) {
+         return;
+      }
+
+      if (!persisted.visualQueue.push(s)) {
+         Serial.printf("[%lu] TG: fila visual cheia; transicao mais antiga coalescida (dropped=%u)\n", static_cast<unsigned long>(millis()),
+                       static_cast<unsigned>(persisted.visualQueue.dropped));
+      }
+
+      saveState();
    }
 
    void enqueue(const PowerState &power, const Timestamp &ts, uint8_t rebootReason = REBOOT_REASON_NONE) {
@@ -148,6 +162,9 @@ namespace {
       // load; redeFailStarted is that same instant. The two always describe the same moment.
       enqueue(redeFailState, persisted.redeFailStarted);
       notifier.onRedeTransition(persisted.redeFailStarted);
+      // A confirmed FALTA is a real transition: its snapshot (the state AT the fall instant) is
+      // queued for the visual line, in chronological order.
+      enqueueVisual(redeFailState);
       saveState();
    }
 
@@ -196,6 +213,7 @@ namespace {
       }
 
       enqueue(current, ts);
+      enqueueVisual(current); // the confirmed transition snapshot (state at this instant)
       persisted.power = current;
 
       if (redeChanged) {
@@ -623,22 +641,18 @@ namespace {
       return true;
    }
 
-   // Sends the visual line once per boot (right after the boot text) and whenever a change
-   // of the four signals has been settled. A provisional redeDisponivel fall - one that is
-   // still inside the grace window - is never represented by a change driven line: it waits
-   // until the window is resolved (FALTA confirmed or fall discarded). A discarded fall
-   // leaves the state equal to the last one reported, which suppresses the message entirely.
-   // While a FALTA/RETORNO sequence is in flight (tgPhase != NONE) the line waits, so the
-   // existing coalescing is respected and nothing interleaves with the stickers/texts.
+   // Sends ONE visual line per pass when Telegram is free. The line reflects a queued confirmed
+   // transition (the state captured at that transition) or, when nothing is queued, the silent
+   // preventive renewal of the current line. A FALTA/RETORNO sequence in flight (tgPhase != NONE)
+   // merely DEFERS the sends: the queue keeps every confirmed transition, sent in chronological
+   // order once the sequence finished.
    //
-   // Exactly one visual message is kept: the previous one is deleted only AFTER the new
-   // one was confirmed (its id is persisted first). If that deletion fails, its id stays
-   // persisted (visualDeletePendingId) and no new line is sent until it succeeds, so
-   // orphan bubbles never accumulate. Changes arriving meanwhile keep arming visualPending
-   // and are coalesced into the current state.
+   // Exactly one visual message is kept: the previous one is deleted only AFTER the new one was
+   // confirmed (its id is persisted first). A pending replacement deletion is resolved first and
+   // blocks the next line only on a TRANSIENT failure (a permanent refusal drops the id).
    void serviceVisualNotice() {
-      // A boot notice permanently refused by the API means the bot cannot post at all: the LED
-      // line is not attempted either (it would only repeat the same doomed request).
+      // A boot notice permanently refused by the API means the bot cannot post at all: the LED line
+      // is not attempted either (it would only repeat the same doomed request).
       if (bootNoticeAbandoned) {
          return;
       }
@@ -652,12 +666,11 @@ namespace {
       }
 
       if (persisted.tgPhase != TG_PHASE_NONE) {
-         return;
+         return; // never interleave with the FALTA/RETORNO sequence
       }
 
-      // A previous visual message awaiting its deletion blocks any new visual message:
-      // the pending deletion is retried first. The current state stays pending
-      // (visualPending) and coalesced, and is sent once the deletion is resolved.
+      // Resolve a previous line awaiting its deletion first (Model B): the deletion is retried
+      // before a new line is created.
       if (persisted.visualDeletePendingId != 0) {
          if (resolvePendingDelete(persisted.visualDeletePendingId, "LEDs antigos")) {
             persisted.visualDeletePendingId = 0;
@@ -670,54 +683,47 @@ namespace {
          }
       }
 
-      if (!visualPending) {
+      const VisualSendKind kind = visualNextSend(persisted.visualQueue.empty(), persisted.visualRenewPending != 0);
+
+      if (kind == VisualSendKind::None) {
          return;
       }
 
-      // The boot line mirrors the GPIOs even while a grace window is pending; a change
-      // driven line never does.
-      if (persisted.redeFailGraceActive && visualStateKnown) {
-         return;
-      }
-
-      // Stability window. The boot line is exempt, so it follows the boot text right away.
-      if (!visualBootPending && static_cast<uint32_t>(millis() - visualArmedMillis) < VISUAL_NOTICE_GRACE_MS) {
-         return;
-      }
-
-      const PowerState current = inputs.state();
-
-      if (visualStateKnown && samePowerState(current, lastVisualState)) {
-         visualPending = false; // the fall was transient: same state as the last one reported
-         return;
-      }
-
-      // Consumed before the send: a change during the send re-arms the flag.
-      visualPending = false;
+      const bool silent = (kind == VisualSendKind::SilentRenewal);
+      const PowerState line = (kind == VisualSendKind::RealChange) ? *persisted.visualQueue.front() : inputs.state();
 
       int32_t messageId = 0;
+      uint32_t dateEpoch = 0;
 
-      if (telegram.sendText(visualLine(current), messageId) && messageId > 0) {
+      if (telegram.sendText(visualLine(line), messageId, dateEpoch, silent) && messageId > 0) {
          telegramRetryClear();
 
          const int32_t previousId = persisted.lastVisualMessageId;
 
-         // Persist the new id and the previous one BEFORE deleting: a failure between the
-         // two steps can never lose the current visual state.
+         // Persist the new id and the previous one BEFORE deleting: a failure between the two steps
+         // can never lose the current visual state.
          persisted.lastVisualMessageId = messageId;
          persisted.visualDeletePendingId = (previousId > 0 && previousId != messageId) ? previousId : 0;
+
+         if (kind == VisualSendKind::RealChange) {
+            persisted.visualQueue.pop();
+         }
+
+         // A real change (or the renewal itself) satisfied any pending-renewal need.
+         persisted.visualRenewPending = 0;
+
          saveState();
 
-         lastVisualState = current;
+         lastVisualState = line;
          visualStateKnown = true;
-         visualBootPending = false;
 
-         Serial.printf("[%lu] TG: LEDs enviados rede=%d alim_rede=%d offgrid=%d gerador=%d id=%ld\n", static_cast<unsigned long>(millis()),
-                       current.redeDisponivel ? 1 : 0, current.alimentacaoRede ? 1 : 0, current.alimentacaoOffgrid ? 1 : 0,
-                       current.alimentacaoGerador ? 1 : 0, static_cast<long>(messageId));
+         Serial.printf("[%lu] TG: LEDs enviados%s rede=%d alim_rede=%d offgrid=%d gerador=%d id=%ld pendentes=%u\n",
+                       static_cast<unsigned long>(millis()), silent ? " (renovacao silenciosa)" : "", line.redeDisponivel ? 1 : 0,
+                       line.alimentacaoRede ? 1 : 0, line.alimentacaoOffgrid ? 1 : 0, line.alimentacaoGerador ? 1 : 0, static_cast<long>(messageId),
+                       static_cast<unsigned>(persisted.visualQueue.count));
 
-         // Replace the previous visual message. If the deletion fails, the id stays
-         // persisted and the next pass retries it (blocking any new line until then).
+         // Replace the previous visual message. If the deletion fails, the id stays persisted and
+         // the next pass retries it (blocking any new line until then).
          if (persisted.visualDeletePendingId != 0) {
             if (resolvePendingDelete(persisted.visualDeletePendingId, "LEDs antigos")) {
                persisted.visualDeletePendingId = 0;
@@ -730,17 +736,14 @@ namespace {
                telegramRetrySchedule("LEDs antigos");
             }
          }
+      } else if (telegram.lastErrorFatal()) {
+         // Same reasoning as the boot notice: a permanent refusal is not retried.
+         bootNoticeAbandoned = true;
+         Serial.printf("[%lu] TG: LEDs abandonados neste boot (error_code=%d sem recuperacao possivel)\n",
+                       static_cast<unsigned long>(millis()), telegram.lastErrorCode());
       } else {
-         if (telegram.lastErrorFatal()) {
-            // Same reasoning as the boot notice: a permanent refusal is not retried.
-            bootNoticeAbandoned = true;
-            visualPending = false;
-            Serial.printf("[%lu] TG: LEDs abandonados neste boot (error_code=%d sem recuperacao possivel)\n",
-                          static_cast<unsigned long>(millis()), telegram.lastErrorCode());
-         } else {
-            visualPending = true; // retry with the state detected then
-            telegramRetrySchedule("LEDs");
-         }
+         // Transient: the queued snapshots are KEPT and retried later (never discarded here).
+         telegramRetrySchedule("LEDs");
       }
    }
 
@@ -805,10 +808,10 @@ namespace {
          saveState();
 
          bootTextSent = true;
-         // The visual line follows the boot text (serviceVisualNotice(), same loop pass) and
-         // is exempt from the stability window.
-         visualPending = true;
-         visualBootPending = true;
+         // The boot line follows the boot text (serviceVisualNotice(), same loop pass). It is a
+         // normal queued snapshot of the current state; at boot visualStateKnown is false, so it is
+         // always enqueued.
+         enqueueVisual(inputs.state());
 
          Serial.printf("[%lu] TG: notificacao de boot enviada (motivo=%s) id=%ld\n", static_cast<unsigned long>(millis()),
                        rebootReasonDescription(bootReasonCode), static_cast<long>(messageId));
@@ -919,13 +922,15 @@ namespace {
                     static_cast<unsigned long>(telegram.reuseStalls()), static_cast<unsigned long>(telegram.newConnections()));
 
       Serial.printf("DIAG up=%lus wifi=%d rssi=%d ntp=%d rede=%d pend=%lu head=%lu gap=%u tgPend=%d tgNotif=%d tgForce=%d tgPhase=%s tgStuck=%d "
-                    "fallId=%ld retId=%ld visId=%ld visDelId=%ld\n",
+                    "fallId=%ld retId=%ld visId=%ld visDelId=%ld vq=%u vqDrop=%u renew=%d fallM=%d retM=%d visM=%d\n",
                     static_cast<unsigned long>(now / 1000UL), WiFi.status() == WL_CONNECTED ? 1 : 0, WiFi.RSSI(), timeSource.synced() ? 1 : 0,
                     persisted.power.redeDisponivel ? 1 : 0, static_cast<unsigned long>(count - persisted.tbLogHead),
                     static_cast<unsigned long>(persisted.tbLogHead), persisted.tbGapCount, persisted.tgPending ? 1 : 0, persisted.tgNotifiedRede ? 1 : 0,
                     persisted.tgForceNotify ? 1 : 0, phaseName(persisted.tgPhase), tgPhaseStuck ? 1 : 0, static_cast<long>(persisted.lastFallStickerId),
                     static_cast<long>(persisted.lastReturnStickerId), static_cast<long>(persisted.lastVisualMessageId),
-                    static_cast<long>(persisted.visualDeletePendingId));
+                    static_cast<long>(persisted.visualDeletePendingId), static_cast<unsigned>(persisted.visualQueue.count),
+                    static_cast<unsigned>(persisted.visualQueue.dropped), persisted.visualRenewPending ? 1 : 0, persisted.fallStickerMaint,
+                    persisted.retStickerMaint, persisted.visualMaint);
 
       Serial.printf("[%lu] BOOT DIAG: bootId=%ld bootDelId=%ld reason=%s\n", static_cast<unsigned long>(now),
                     static_cast<long>(persisted.lastBootMessageId), static_cast<long>(persisted.bootDeletePendingId),
@@ -1054,10 +1059,8 @@ void loop() {
          const PowerState current = inputs.state();
 
          if (!samePowerState(current, persisted.power)) {
-            handleTransition(current, timeSource.now());
-            visualArmedMillis = millis(); // every change restarts the stability window
-            visualPending = true;         // the settled state is reported by serviceVisualNotice()
-            bootNoticeAbandoned = false;  // a new transition is a fresh chance for the Telegram API
+            handleTransition(current, timeSource.now()); // also queues the visual snapshot
+            bootNoticeAbandoned = false;                 // a new transition is a fresh chance for the Telegram API
             printState("Transicao:", current);
          }
 

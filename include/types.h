@@ -115,6 +115,59 @@ enum BootReason : uint8_t {
    BOOT_REASON_OTA
 };
 
+// FIFO of confirmed electrical transitions awaiting a Telegram visual line.
+//
+// The Telegram visual line is a "current state" mirror, but a burst of transitions (a FALTA
+// followed by a RETORNO inside one text sequence, for instance) must ALL be preserved: the line
+// is sent in chronological order once no FALTA/RETORNO sequence is in flight. The queue is kept
+// small; on overflow the OLDEST snapshot is coalesced away and false is returned so the caller
+// can log it (a pending transition is never discarded silently).
+//
+// Pure data plus inline helpers, so the same code runs on the target and in the host tests.
+constexpr uint8_t VISUAL_QUEUE_CAP = 8;
+
+struct VisualQueue {
+   PowerState items[VISUAL_QUEUE_CAP]{};
+   uint8_t head = 0;     // index of the oldest item
+   uint8_t count = 0;    // number of valid items
+   uint16_t dropped = 0; // diagnostic: snapshots coalesced away on overflow (never silent)
+
+   void clear() {
+      head = 0;
+      count = 0;
+      dropped = 0;
+   }
+
+   bool empty() const { return count == 0; }
+
+   const PowerState *front() const { return (count == 0) ? nullptr : &items[head]; }
+
+   // Appends one snapshot. On overflow the OLDEST snapshot is coalesced away and false is
+   // returned so the caller can log it.
+   bool push(const PowerState &s) {
+      bool ok = true;
+
+      if (count == VISUAL_QUEUE_CAP) {
+         pop();
+         ++dropped;
+         ok = false;
+      }
+
+      items[(head + count) % VISUAL_QUEUE_CAP] = s;
+      ++count;
+      return ok;
+   }
+
+   void pop() {
+      if (count == 0) {
+         return;
+      }
+
+      head = static_cast<uint8_t>((head + 1) % VISUAL_QUEUE_CAP);
+      --count;
+   }
+};
+
 struct PersistedState {
    bool validReliable = false;
    PowerState power{};
@@ -170,6 +223,33 @@ struct PersistedState {
    // (retried until it succeeds). Appended at the END so the existing offsets are unchanged.
    int32_t lastBootMessageId = 0;
    int32_t bootDeletePendingId = 0;
+
+   // --- Appended by firmware 1.6.0 (size-aware migration in state_store.cpp) ---
+   //
+   // Visual snapshot queue: confirmed electrical transitions waiting for a Telegram line. Every
+   // confirmed transition is queued (captured at the transition instant) and sent in
+   // chronological order once no FALTA/RETORNO sequence is in flight. Persisted so a reboot never
+   // loses a confirmed transition. Appended at the END to keep every earlier field offset.
+   VisualQueue visualQueue{};
+
+   // Preventive deletion before the Telegram 48 h limit. For each tracked message the firmware
+   // keeps the CONFIRMED send instant (Unix seconds; 0 = unknown) and the earliest next attempt
+   // (Unix seconds; 0 = no gate), so the whole window survives a reboot. The per-message state is
+   // a MaintState (see tg_maint.h); it is stored as a raw uint8_t here so types.h stays free of
+   // that header.
+   uint32_t fallStickerSentEpoch = 0;
+   uint32_t fallStickerNextAttempt = 0;
+   uint8_t fallStickerMaint = 0;
+
+   uint32_t retStickerSentEpoch = 0;
+   uint32_t retStickerNextAttempt = 0;
+   uint8_t retStickerMaint = 0;
+
+   uint32_t visualSentEpoch = 0;
+   uint32_t visualNextAttempt = 0;
+   uint8_t visualMaint = 0;
+   // Set after the visual line was deleted preventively and a silent replacement must be sent.
+   uint8_t visualRenewPending = 0;
 };
 
 // Reason of a boot/reboot. The CODE is the STABLE value published (as a NUMBER) to ThingsBoard

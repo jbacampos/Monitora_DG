@@ -41,6 +41,7 @@ include/
   telemetry.h         MQTT/TLS, fila historica, snapshot de boot, heartbeat
   telegram.h          API HTTP de baixo nivel do Telegram
   telegram_notifier.h coalescimento, stickers e textos
+  tg_maint.h          fila visual + politica de exclusao preventiva (pura, testavel no host)
   wifi_manager.h      conectividade
   ota.h               /ota
   secrets.h.example   credenciais (copie para secrets.h)
@@ -54,6 +55,14 @@ test/
 
 - `/state.bin` = um unico `PersistedState`, escrito em `/state.tmp` e depois `rename`
   (o rename do LittleFS substitui o destino de forma atomica). Sem CRC e sem slots A/B.
+  A versao 1.6.0 acrescentou no **fim** da struct a fila de fotografias visuais (`visualQueue`)
+  e os metadados da exclusao preventiva; todos os campos anteriores mantem offset e tipo, entao
+  um `state.bin` antigo e um **prefixo** exato do atual. Tamanhos reconhecidos: 60/68/76/84
+  (1.0.0..1.5.0) e o atual (156). `StateStore::load()` adota o prefixo (os campos novos ficam nos
+  valores seguros = zero: nenhuma exclusao e agendada para mensagens enviadas antes da
+  atualizacao), grava a migracao de forma **atomica** (temp + rename; o original e preservado ate
+  o rename) e recusa qualquer tamanho **desconhecido** com diagnostico explicito (um arquivo
+  parcial nunca e interpretado como estado valido).
 - `/pending.bin` = log **append-only** de `PendingRecord` (16 B: `Timestamp` 8 + `PowerState`
   4 + `rebootReason` 1 + 3 de alinhamento), precedido por um cabecalho de formato de 4 B
   (`PENDING_MAGIC`). O `tbLogHead` (em `state.bin`) aponta o proximo registro a publicar. O
@@ -149,12 +158,16 @@ transferir a carga), nunca o estado do fim da janela.
   (401 token, 403 sem direito, 400 `chat not found`, sticker invalido, 409 webhook) abandonam
   imediatamente, sem laco de requisicoes.
 - As listas de adjetivos/verbos do rascunho foram preservadas sem alteracao.
-- **Estado visual (4 LEDs)**: existe sempre no maximo **uma** mensagem. Ao enviar a nova
-  linha, o novo `message_id` e o anterior (guardado como `visualDeletePendingId`) sao
-  persistidos ANTES de apagar o anterior. Se a exclusao falhar de forma transitoria, o id fica
-  pendente e nenhuma nova linha e enviada ate a exclusao ser confirmada (as mudancas continuam
-  sendo coalescidas no estado atual); se a API recusar para sempre, o id e descartado e a linha
-  atual e enviada. O texto de boot e a linha de boot permanecem inalterados.
+- **Estado visual (4 LEDs)**: existe sempre no maximo **uma** mensagem. Cada transicao eletrica
+  **confirmada** e enfileirada (`PersistedState::visualQueue`) com o estado capturado **no instante
+  da transicao** e enviada em ordem cronologica assim que a sequencia FALTA/RETORNO termina
+  (`tgPhase == NONE`); uma FALTA seguida de RETORNO preserva **as duas** fotografias (a sequencia
+  adia os envios, nunca os descarta). Uma queda ainda dentro da janela de graca nao entra na fila
+  (so a FALTA confirmada). Ao enviar a nova linha, o novo `message_id` e o anterior (guardado como
+  `visualDeletePendingId`) sao persistidos ANTES de apagar o anterior. Se a exclusao falhar de
+  forma transitoria, o id fica pendente e nenhuma nova linha e enviada ate a exclusao ser
+  confirmada; se a API recusar para sempre, o id e descartado e a linha atual e enviada. O texto de
+  boot e a linha de boot permanecem inalterados.
 - **Mensagem de reinicio**: existe sempre no maximo **uma**. Mesmo esquema (Model B) da linha
   visual: o novo `message_id` e o anterior (`bootDeletePendingId`) sao persistidos ANTES de
   apagar o anterior; enquanto uma exclusao estiver pendente nenhuma nova mensagem de reinicio e

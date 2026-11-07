@@ -56,15 +56,42 @@ bool StateStore::load(PersistedState &state) {
       return false;
    }
 
-   if (file.size() != sizeof(PersistedState)) {
+   const size_t fileSize = file.size();
+
+   // Unknown size: never interpret the image partially (a truncated/corrupt state.bin would load
+   // garbage). The caller keeps its defaults and this is reported explicitly.
+   if (!StateMigration::isKnownSize(fileSize)) {
       file.close();
+      Serial.printf("ERRO: state.bin com tamanho desconhecido (%u bytes); ignorado (defaults).\n", static_cast<unsigned>(fileSize));
       return false;
    }
 
-   const size_t readBytes = file.read(reinterpret_cast<uint8_t *>(&state), sizeof(PersistedState));
+   uint8_t buffer[sizeof(PersistedState)];
+   const size_t readBytes = file.read(buffer, fileSize);
    file.close();
 
-   return readBytes == sizeof(PersistedState);
+   if (readBytes != fileSize) {
+      Serial.println("ERRO: leitura incompleta de state.bin; ignorado (defaults).");
+      return false;
+   }
+
+   if (!StateMigration::adopt(buffer, fileSize, state)) {
+      return false;
+   }
+
+   // A legacy image was adopted: migrate it in place, atomically (temp file + rename), so the new
+   // fields are persisted and the next boot reads the current size. The original file is preserved
+   // until the rename confirms the write.
+   if (fileSize != sizeof(PersistedState)) {
+      if (writeReplacing(STATE_TMP, STATE_FILE, &state, sizeof(PersistedState))) {
+         Serial.printf("STATE: migrado de %u para %u bytes (estado anterior preservado).\n", static_cast<unsigned>(fileSize),
+                       static_cast<unsigned>(sizeof(PersistedState)));
+      } else {
+         Serial.println("AVISO: falha ao gravar a migracao de state.bin; original preservado (tentado no proximo boot).");
+      }
+   }
+
+   return true;
 }
 
 bool StateStore::save(const PersistedState &state) {

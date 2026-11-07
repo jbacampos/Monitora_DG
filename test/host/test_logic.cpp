@@ -18,8 +18,11 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "input_group.h"
+#include "state_store.h"
+#include "tg_maint.h"
 #include "types.h"
 
 namespace {
@@ -373,6 +376,112 @@ void testContradictions() {
    EXPECT(powerStateContradictory(makeState(false, true, true, false)));  // grid feed + offgrid feed, no grid
 }
 
+// ---------------------------------------------------------------------------------------------
+// Visual snapshot queue (ETAPA 1): a rapid FALTA -> RETORNO keeps BOTH snapshots, in order; the
+// overflow coalesces the oldest and reports it (never silently).
+// ---------------------------------------------------------------------------------------------
+void testVisualQueue() {
+   VisualQueue q;
+   q.clear();
+   EXPECT(q.empty());
+
+   const PowerState fall = makeState(false, false, true, false); // FALTA: fed by the offgrid
+   const PowerState back = makeState(true, true, false, false);  // RETORNO: fed by the grid
+
+   // Rapid FALTA -> RETORNO: both preserved, in chronological order.
+   EXPECT(q.push(fall));
+   EXPECT(q.push(back));
+   EXPECT(q.count == 2);
+   EXPECT_STATE(*q.front(), false, false, true, false);
+   q.pop();
+   EXPECT_STATE(*q.front(), true, true, false, false);
+   q.pop();
+   EXPECT(q.empty());
+
+   // Overflow: the OLDEST is coalesced and reported.
+   for (uint8_t i = 0; i < VISUAL_QUEUE_CAP; ++i) {
+      EXPECT(q.push(makeState((i & 1) != 0, false, false, false)));
+   }
+   EXPECT(q.count == VISUAL_QUEUE_CAP);
+   EXPECT(!q.push(makeState(true, false, false, true))); // full -> false (logged by the caller)
+   EXPECT(q.count == VISUAL_QUEUE_CAP);
+   EXPECT(q.dropped == 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Real change vs silent renewal (ETAPA 2.4/2.5): a queued change always wins; the silent renewal
+// only goes out when nothing is queued.
+// ---------------------------------------------------------------------------------------------
+void testVisualSendPriority() {
+   EXPECT(visualNextSend(false, true) == VisualSendKind::RealChange);
+   EXPECT(visualNextSend(false, false) == VisualSendKind::RealChange);
+   EXPECT(visualNextSend(true, true) == VisualSendKind::SilentRenewal);
+   EXPECT(visualNextSend(true, false) == VisualSendKind::None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// state.bin migration: an older image is an exact byte-prefix of the current layout. Every field
+// that existed before is preserved and the appended fields stay at their safe defaults. An unknown
+// size is rejected (never partially interpreted).
+// ---------------------------------------------------------------------------------------------
+void testStateMigration() {
+   PersistedState original{};
+   original.validReliable = true;
+   original.power = makeState(false, false, true, false);
+   original.tbLogHead = 0x01020304u;
+   original.tbGapCount = 7;
+   original.lastFallStickerId = 4242;
+   original.lastVisualMessageId = 777;
+   original.lastBootMessageId = 888;
+   original.tgPhase = TG_PHASE_TEXT_RET;
+   original.bootDeletePendingId = 55;
+
+   // The first 84 bytes of the current struct ARE the 1.5.0 layout (fields were only appended), so
+   // this is a faithful fixture of the previous firmware's state.bin.
+   uint8_t legacy[84];
+   memcpy(legacy, &original, sizeof(legacy));
+
+   EXPECT(StateMigration::isLegacySize(60));
+   EXPECT(StateMigration::isLegacySize(68));
+   EXPECT(StateMigration::isLegacySize(76));
+   EXPECT(StateMigration::isLegacySize(84));
+   EXPECT(!StateMigration::isLegacySize(85));
+   EXPECT(StateMigration::isKnownSize(sizeof(PersistedState)));
+   EXPECT(!StateMigration::isKnownSize(85));
+   EXPECT(!StateMigration::isKnownSize(sizeof(PersistedState) + 1));
+
+   // Poison the appended fields to prove the migration zeroes them.
+   PersistedState migrated{};
+   migrated.fallStickerMaint = 9;
+   migrated.visualRenewPending = 9;
+   migrated.visualSentEpoch = 0xDEADBEEFu;
+
+   EXPECT(StateMigration::adopt(legacy, 84, migrated));
+
+   // Every field inside the first 84 bytes is preserved.
+   EXPECT(migrated.validReliable);
+   EXPECT_STATE(migrated.power, false, false, true, false);
+   EXPECT(migrated.tbLogHead == 0x01020304u);
+   EXPECT(migrated.tbGapCount == 7);
+   EXPECT(migrated.lastFallStickerId == 4242);
+   EXPECT(migrated.lastVisualMessageId == 777);
+   EXPECT(migrated.lastBootMessageId == 888);
+   EXPECT(migrated.tgPhase == TG_PHASE_TEXT_RET);
+   EXPECT(migrated.bootDeletePendingId == 55);
+
+   // The appended fields are safe defaults: no artificial deletion, empty visual queue.
+   EXPECT(migrated.visualQueue.empty());
+   EXPECT(migrated.fallStickerSentEpoch == 0);
+   EXPECT(migrated.fallStickerNextAttempt == 0);
+   EXPECT(migrated.fallStickerMaint == 0);
+   EXPECT(migrated.visualSentEpoch == 0);
+   EXPECT(migrated.visualRenewPending == 0);
+
+   // An unknown size is rejected and never partially interpreted.
+   PersistedState untouched{};
+   EXPECT(!StateMigration::adopt(legacy, 85, untouched));
+}
+
 } // namespace
 
 int main() {
@@ -383,6 +492,9 @@ int main() {
    testLongOverlapIsReported();
    testTimestamps();
    testContradictions();
+   testVisualQueue();
+   testVisualSendPriority();
+   testStateMigration();
 
    printf("\n%d verificacoes, %d falha(s)\n", checks, failures);
 
