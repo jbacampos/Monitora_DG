@@ -8,6 +8,7 @@
 
 #include "config.h"
 #include "secrets.h"
+#include "time_source.h"
 
 namespace {
    // ---------------------------------------------------------------------------
@@ -129,6 +130,13 @@ namespace {
 
       return (end < 0) ? url.substring(start) : url.substring(start, end);
    }
+
+   // GitHub quota/limit response headers. Named once so collectHeaders() and header() always use
+   // exactly the same string (header() matches the collected key by content).
+   constexpr char HDR_RATE_LIMIT[]     = "X-RateLimit-Limit";
+   constexpr char HDR_RATE_REMAINING[] = "X-RateLimit-Remaining";
+   constexpr char HDR_RATE_RESET[]     = "X-RateLimit-Reset";
+   constexpr char HDR_RETRY_AFTER[]    = "Retry-After";
 } // namespace
 
 bool Ota::begin() {
@@ -194,11 +202,44 @@ Ota::VersionStatus Ota::checkVersion(String &remoteVersion) {
    http.setUserAgent(String("Monitora_DG/") + FIRMWARE_VERSION);
    http.addHeader("Accept", "application/vnd.github+json");
 
+   // Authenticate with the repository Personal Access Token already present in secrets.h. The
+   // authenticated quota replaces the anonymous 60 requests/hour. The token is used ONLY here and is
+   // NEVER printed: no log below includes the Authorization header or its value.
+   http.addHeader("Authorization", String("Bearer ") + TELEGRAM_REPO_TOKEN);
+
+   // GitHub sends its quota in these headers. HTTPClient discards uncollected response headers, so
+   // they must be requested BEFORE the call, otherwise header() would always return an empty string.
+   const char *quotaHeaders[] = {HDR_RATE_LIMIT, HDR_RATE_REMAINING, HDR_RATE_RESET, HDR_RETRY_AFTER};
+   http.collectHeaders(quotaHeaders, sizeof(quotaHeaders) / sizeof(quotaHeaders[0]));
+
    const int status = http.GET();
 
    VersionStatus result = VersionStatus::Unknown;
    size_t bodyLength = 0;
    const int mfln = client.getMFLNStatus();
+
+   // Quota diagnostics (never the token): the HTTP code plus GitHub's rate-limit headers, so a rate
+   // limit can be told apart from an HTTP/DNS/timeout failure. No retry is ever attempted.
+   const String headerLimit = http.header(HDR_RATE_LIMIT);
+   const String headerRemaining = http.header(HDR_RATE_REMAINING);
+   const String headerReset = http.header(HDR_RATE_RESET);
+   const String headerRetryAfter = http.header(HDR_RETRY_AFTER);
+
+   char resetText[24] = "-";
+
+   if (!headerReset.isEmpty()) {
+      const uint32_t resetEpoch = static_cast<uint32_t>(strtoul(headerReset.c_str(), nullptr, 10));
+
+      if (resetEpoch > 0) {
+         // Reuses the project's Brasilia formatter. It formats the absolute epoch as-is, so it does
+         // not depend on the local clock being NTP-synced.
+         TimeSource::formatBrasilia(resetEpoch, resetText, sizeof(resetText));
+      }
+   }
+
+   Serial.printf("[%lu] OTA VER: auth=1 http=%d ratelimit=%s/%s reset=%s retry_after=%s\n", static_cast<unsigned long>(millis()), status,
+                 headerLimit.isEmpty() ? "-" : headerLimit.c_str(), headerRemaining.isEmpty() ? "-" : headerRemaining.c_str(), resetText,
+                 headerRetryAfter.isEmpty() ? "-" : headerRetryAfter.c_str());
 
    if (status == HTTP_CODE_OK) {
       // getString() returns the payload owned by HTTPClient (valid until end()), so holding a
@@ -240,6 +281,19 @@ Ota::VersionStatus Ota::checkVersion(String &remoteVersion) {
             }
          }
       }
+   } else if (status == 403 || status == 429) {
+      // GitHub's primary (403) and secondary (429) rate limits. Nothing is retried: the /ota request
+      // is reported as not verified and abandoned until the user sends /ota again.
+      Serial.printf("[%lu] OTA VER: rate limit do GitHub http=%d; sem retry, versao remota nao verificada\n",
+                    static_cast<unsigned long>(millis()), status);
+   } else if (status > 0) {
+      // Any other definitive HTTP reply (401 token invalido, 404, 5xx, ...).
+      Serial.printf("[%lu] OTA VER: resposta HTTP inesperada http=%d; versao remota nao verificada\n", static_cast<unsigned long>(millis()), status);
+   } else {
+      // Negative code: no HTTP reply at all (connect/TLS failure; a read timeout is
+      // HTTPC_ERROR_READ_TIMEOUT = -11).
+      Serial.printf("[%lu] OTA VER: falha de transporte http=%d (connect/TLS/timeout); versao remota nao verificada\n",
+                    static_cast<unsigned long>(millis()), status);
    }
 
    http.end();
