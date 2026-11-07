@@ -705,11 +705,6 @@ namespace {
          persisted.lastVisualMessageId = messageId;
          persisted.visualDeletePendingId = (previousId > 0 && previousId != messageId) ? previousId : 0;
 
-         // A fresh line starts its own 48 h preventive cycle from the CONFIRMED send instant.
-         persisted.visualSentEpoch = dateEpoch;
-         persisted.visualNextAttempt = 0;
-         persisted.visualMaint = static_cast<uint8_t>(MaintState::Waiting);
-
          if (kind == VisualSendKind::RealChange) {
             persisted.visualQueue.pop();
          }
@@ -750,117 +745,6 @@ namespace {
          // Transient: the queued snapshots are KEPT and retried later (never discarded here).
          telegramRetrySchedule("LEDs");
       }
-   }
-
-   // The current instant as an ABSOLUTE Unix time (seconds); 0 when no absolute clock exists.
-   uint32_t absoluteNow() {
-      if (timeSource.synced()) {
-         return timeSource.now().value;
-      }
-
-      return 0;
-   }
-
-   // Handles ONE tracked message per pass: starts ~60 min before the 48 h limit, retries every
-   // ~5 min (honouring retry_after) and gives up once the mark passed. Returns true when it took an
-   // action, so the caller stops for this pass and the TLS client stays strictly sequential.
-   // A deletion failure is never treated as a send failure (the shared send backoff is untouched).
-   bool preventiveStep(int32_t &id, uint32_t &sentEpoch, uint32_t &nextAttempt, uint8_t &maint, bool isVisual, const char *label,
-                       uint32_t nowEpoch) {
-      const MaintAction action = maintDecide(maint, sentEpoch, nextAttempt, nowEpoch);
-
-      if (action == MaintAction::None) {
-         return false;
-      }
-
-      if (action == MaintAction::GiveUp) {
-         maint = static_cast<uint8_t>(MaintState::Expired);
-         saveState();
-
-         Serial.printf("[%lu] TG: %s: janela de 48h vencida sem exclusao preventiva; desistindo\n", static_cast<unsigned long>(millis()), label);
-         return true;
-      }
-
-      if (id <= 0) {
-         // Nothing to delete: stop tracking.
-         maint = static_cast<uint8_t>(MaintState::Done);
-         sentEpoch = 0;
-         nextAttempt = 0;
-         saveState();
-         return true;
-      }
-
-      const Telegram::DeleteResult result = telegram.deleteMessage(id);
-
-      if (result == Telegram::DeleteResult::Failed) {
-         // Transient: honour retry_after and retry inside the window, without touching the shared
-         // send backoff (a deletion failure must not be treated as a send failure).
-         uint32_t wait = TG_DELETE_RETRY_S;
-
-         if (telegram.lastRetryAfterSeconds() > wait) {
-            wait = telegram.lastRetryAfterSeconds();
-         }
-
-         nextAttempt = nowEpoch + wait;
-         saveState();
-
-         Serial.printf("[%lu] TG: %s: exclusao preventiva falhou (transitorio); nova tentativa em %us\n", static_cast<unsigned long>(millis()),
-                       label, static_cast<unsigned>(wait));
-         return true;
-      }
-
-      // Deleted / NotFound / Impossible: the message no longer blocks.
-      maint = static_cast<uint8_t>(MaintState::Done);
-      sentEpoch = 0;
-      nextAttempt = 0;
-
-      if (isVisual) {
-         // The line is gone: a silent replacement must be sent (serviceVisualNotice()).
-         persisted.lastVisualMessageId = 0;
-         persisted.visualRenewPending = 1;
-      }
-
-      saveState();
-
-      Serial.printf("[%lu] TG: %s apagada preventivamente (id=%ld)%s\n", static_cast<unsigned long>(millis()), label, static_cast<long>(id),
-                    isVisual ? "; renovacao silenciosa pendente" : "");
-      return true;
-   }
-
-   // Preventive deletion of the bot's own messages before Telegram's 48 h limit. Runs at most one
-   // action per pass, only when no FALTA/RETORNO sequence is in flight and Telegram is free, so it
-   // never blocks getUpdates()/commands, ThingsBoard, the sequences or new transitions.
-   void servicePreventiveDeletion() {
-      if (WiFi.status() != WL_CONNECTED) {
-         return;
-      }
-
-      if (persisted.tgPhase != TG_PHASE_NONE) {
-         return;
-      }
-
-      if (telegramRetryWaiting()) {
-         return; // a send is backing off; do not add requests
-      }
-
-      const uint32_t nowEpoch = absoluteNow();
-
-      if (nowEpoch == 0) {
-         return; // the window needs absolute time
-      }
-
-      if (preventiveStep(persisted.lastFallStickerId, persisted.fallStickerSentEpoch, persisted.fallStickerNextAttempt, persisted.fallStickerMaint,
-                         false, "sticker FALTA", nowEpoch)) {
-         return;
-      }
-
-      if (preventiveStep(persisted.lastReturnStickerId, persisted.retStickerSentEpoch, persisted.retStickerNextAttempt, persisted.retStickerMaint, false,
-                         "sticker RETORNO", nowEpoch)) {
-         return;
-      }
-
-      preventiveStep(persisted.lastVisualMessageId, persisted.visualSentEpoch, persisted.visualNextAttempt, persisted.visualMaint, true, "linha visual",
-                     nowEpoch);
    }
 
    // One Telegram reboot notice per boot. Exactly one notice is kept, using the same Model B
@@ -1205,9 +1089,6 @@ void loop() {
 
    // Visual state line: after the boot text and after any accepted change of the signals.
    serviceVisualNotice();
-
-   // Preventive deletion before the Telegram 48 h limit (stickers and the visual line).
-   servicePreventiveDeletion();
 
    const uint32_t afterTg = millis();
 
