@@ -188,10 +188,15 @@ transferir a carga), nunca o estado do fim da janela.
   criada. A exclusao so conta como confirmada quando a API responde `{"ok":true,"result":true}`
   (nao basta um HTTP 200: `{"ok":false,...}` e falha). O conteudo da mensagem de boot permanece
   inalterado (o motivo aparece em portugues). Independente de FALTA/RETORNO e da linha visual.
-- Comandos: `/reboot` e `/ota` (autorizados por `TELEGRAM_CHAT_ID`). O `getUpdates()` espera a
-  sequencia de notificacao terminar, mas **nunca** fica preso: uma fase sem progresso por
-  `TELEGRAM_PHASE_STUCK_MS` (120 s) libera o poll (`DIAG ... tgStuck=1`) e os comandos voltam a
-  responder.
+- Comandos: `/reboot`, `/ota` e `/s` (autorizados por `TELEGRAM_CHAT_ID`). `/s` responde, com envio
+  silencioso (`disable_notification=true`), uma mensagem com uma linha em branco inicial, a versao do
+  firmware (`FIRMWARE_VERSION`), o uptime desde o boot em dias/horas/min/seg (derivado de `millis()`,
+  sem NTP, sem zeros a esquerda) e uma linha `Energia:` com os quatro indicadores na ordem rede,
+  alimentacao pela rede, off-grid e gerador (a mesma figura da linha visual, `InputGroup::state()`).
+  E somente leitura: nao altera o estado, nao reinicia, nao inicia OTA e nao depende de
+  GitHub/ThingsBoard/NTP. O `getUpdates()` espera a sequencia de notificacao terminar, mas **nunca**
+  fica preso: uma fase sem progresso por `TELEGRAM_PHASE_STUCK_MS` (120 s) libera o poll
+  (`DIAG ... tgStuck=1`) e os comandos voltam a responder.
 
 ## Secrets
 

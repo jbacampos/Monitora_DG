@@ -56,6 +56,9 @@ public:
 
    bool commandRebootRequested();
    bool commandOtaRequested();
+   // True once when the authorised user sent "/s". The reply is built and sent by the caller
+   // (main.cpp), which owns the current state and the uptime, exactly like /reboot and /ota.
+   bool commandStatusRequested();
 
    // update_id + 1 of the last processed batch. The caller persists it when a received
    // command is about to reboot the device, before doing so.
@@ -84,6 +87,7 @@ private:
 
    bool rebootRequested_ = false;
    bool otaRequested_ = false;
+   bool statusRequested_ = false;
 
    int lastErrorCode_ = 0;
    bool lastErrorFatal_ = false;

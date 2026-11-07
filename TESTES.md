@@ -60,6 +60,18 @@ reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da
 2. Em cada fase, reinicie o ESP e confirme que o `tgPhase` retoma a operacao.
 3. Verifique `fallId`/`retId` persistidos apos cada envio.
 
+## G2. Telegram - comando `/s` (status)
+
+1. Envie `/s` de um chat **diferente** de `TELEGRAM_CHAT_ID`: nada e respondido (autorizacao, a
+   mesma regra de `/reboot` e `/ota`).
+2. Envie `/s` do chat autorizado: chega uma mensagem **silenciosa** (`disable_notification=true`)
+   com uma linha em branco inicial, `Firmware: <FIRMWARE_VERSION>`, `Uptime: <d/h/m/s>` (sem zeros a
+   esquerda) e `Energia: <4 indicadores>` na ordem rede, alimentacao pela rede, off-grid e gerador
+   (ligado = glifo da cor do canal; desligado = ⚪), coerente com a linha visual atual.
+3. Apos `/reboot`, o primeiro `/s` mostra o uptime recomecando de zero (`millis()` reinicia no boot).
+4. `/s` nao altera nenhum estado, nao reinicia, nao inicia OTA e nao usa GitHub/ThingsBoard/NTP.
+5. `/reboot` e `/ota` continuam funcionando normalmente.
+
 ## H. Stickers
 
 - Apos FALTA: exatamente 1 sticker (Oliver).
@@ -131,7 +143,7 @@ reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da
     associacao sticker<->texto e perdida.
 12. Linha visual: confirmar que TODOS os envios (`sendMessage ... silent=1`) usam
     `disable_notification=true` e que a manutencao NUNCA apaga nem reenvia a linha visual.
-13. `/reboot` e `/ota` continuam respondendo durante a manutencao; a fila visual FIFO permanece
+13. `/reboot`, `/ota` e `/s` continuam respondendo durante a manutencao; a fila visual FIFO permanece
     intacta (`vq`/`vqDrop`).
 
 ## Testes de logica no host (sem hardware)

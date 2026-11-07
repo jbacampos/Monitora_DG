@@ -6,6 +6,7 @@
 
 #include "config.h"
 #include "secrets.h"
+#include "tg_commands.h"
 
 namespace {
    constexpr char TELEGRAM_HOST[] = "api.telegram.org";
@@ -976,10 +977,22 @@ void Telegram::processUpdates(const String &response) {
       command.trim();
       command.toLowerCase();
 
-      if (command == "/reboot") {
-         rebootRequested_ = true;
-      } else if (command == "/ota") {
-         otaRequested_ = true;
+      // The mapping lives in the pure classifyTgCommand() (tg_commands.h) so the host tests cover
+      // the recognition of every command. trim() + toLowerCase() above are the same normalisation
+      // the previous string comparisons used, so /reboot and /ota behave exactly as before.
+      switch (classifyTgCommand(command.c_str())) {
+         case TgCommand::Reboot:
+            rebootRequested_ = true;
+            break;
+         case TgCommand::Ota:
+            otaRequested_ = true;
+            break;
+         case TgCommand::Status:
+            statusRequested_ = true;
+            break;
+         case TgCommand::None:
+         default:
+            break;
       }
    }
 }
@@ -1031,6 +1044,12 @@ bool Telegram::commandRebootRequested() {
 bool Telegram::commandOtaRequested() {
    const bool result = otaRequested_;
    otaRequested_ = false;
+   return result;
+}
+
+bool Telegram::commandStatusRequested() {
+   const bool result = statusRequested_;
+   statusRequested_ = false;
    return result;
 }
 

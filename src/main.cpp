@@ -7,6 +7,7 @@
 #include "ota.h"
 #include "secrets.h"
 #include "state_store.h"
+#include "status_msg.h"
 #include "sticker_maint.h"
 #include "tb_queue.h"
 #include "telegram.h"
@@ -544,6 +545,25 @@ namespace {
          telegram.sendText("Comando /reboot recebido. Reiniciando.");
          delay(100);
          ESP.restart();
+      }
+
+      if (telegram.commandStatusRequested()) {
+         Serial.println("Comando /s recebido.");
+
+         // Read-only diagnostic reply. The four states come from the SAME source used by the
+         // monitoring and by the visual LED line (InputGroup::state() -> PowerState), the version
+         // from FIRMWARE_VERSION and the uptime from millis() (monotonic). Nothing is persisted,
+         // the device is not reset, no OTA runs and no external service (GitHub/ThingsBoard/NTP)
+         // is needed. Posted silently, like the LED state line.
+         char message[512];
+         buildStatusMessage(inputs.state(), FIRMWARE_VERSION, millis(), message, sizeof(message));
+
+         int32_t messageId = 0;
+
+         const bool ok = telegram.sendText(String(message), messageId, true);
+
+         Serial.printf("[%lu] TG: status /s enviado resultado=%s id=%ld\n", static_cast<unsigned long>(millis()), ok ? "OK" : "FALHA",
+                       static_cast<long>(messageId));
       }
    }
 

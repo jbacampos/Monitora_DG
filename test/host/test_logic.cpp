@@ -22,7 +22,9 @@
 
 #include "input_group.h"
 #include "state_store.h"
+#include "status_msg.h"
 #include "sticker_maint.h"
+#include "tg_commands.h"
 #include "tg_maint.h"
 #include "types.h"
 
@@ -687,6 +689,88 @@ void testStickerFlow() {
    EXPECT(stickerDecide(StickerMaintState::Waiting, sentRet, 0, sent + STICKER_DELETE_START_S) == StickerAction::None);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Telegram command recognition (/s, /reboot, /ota). The caller normalises the text (trim +
+// lowercase) before calling classifyTgCommand(), exactly as Telegram::processUpdates() does.
+// ---------------------------------------------------------------------------------------------
+void testTgCommandParsing() {
+   EXPECT(classifyTgCommand("/s") == TgCommand::Status);
+   EXPECT(classifyTgCommand("/reboot") == TgCommand::Reboot);
+   EXPECT(classifyTgCommand("/ota") == TgCommand::Ota);
+
+   // Anything that is not one of the three exact commands is ignored.
+   EXPECT(classifyTgCommand("/sstatus") == TgCommand::None);
+   EXPECT(classifyTgCommand("/sx") == TgCommand::None);
+   EXPECT(classifyTgCommand("/") == TgCommand::None);
+   EXPECT(classifyTgCommand("") == TgCommand::None);
+   EXPECT(classifyTgCommand("/s now") == TgCommand::None);
+   EXPECT(classifyTgCommand("/s@MonitoraBot") == TgCommand::None);
+   EXPECT(classifyTgCommand(nullptr) == TgCommand::None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// /s status message: uptime formatting (d/h/m/s, no leading zeros, units omitted by magnitude), the
+// version (passed in, never hard-coded) and the four energy indicators.
+// ---------------------------------------------------------------------------------------------
+void testStatusMessage() {
+   char buf[64];
+
+   // Uptime: units are omitted by MAGNITUDE, never by a zero value; seconds are always shown.
+   formatUptime(0, buf, sizeof(buf));
+   EXPECT(strcmp(buf, "0m 0s") == 0);
+   formatUptime(25UL * 1000UL, buf, sizeof(buf));
+   EXPECT(strcmp(buf, "0m 25s") == 0);
+   formatUptime((42UL * 60UL + 25UL) * 1000UL, buf, sizeof(buf));
+   EXPECT(strcmp(buf, "42m 25s") == 0);
+   formatUptime((59UL * 60UL + 59UL) * 1000UL, buf, sizeof(buf));
+   EXPECT(strcmp(buf, "59m 59s") == 0);
+   formatUptime(60UL * 60UL * 1000UL, buf, sizeof(buf));
+   EXPECT(strcmp(buf, "1h 0m 0s") == 0);
+   formatUptime(((7UL * 60UL + 42UL) * 60UL + 25UL) * 1000UL, buf, sizeof(buf));
+   EXPECT(strcmp(buf, "7h 42m 25s") == 0);
+   formatUptime(24UL * 60UL * 60UL * 1000UL - 1000UL, buf, sizeof(buf)); // 23h 59m 59s
+   EXPECT(strcmp(buf, "23h 59m 59s") == 0);
+   formatUptime(24UL * 60UL * 60UL * 1000UL, buf, sizeof(buf));
+   EXPECT(strcmp(buf, "1d 0h 0m 0s") == 0);
+   formatUptime(((3UL * 24UL * 60UL + 7UL * 60UL + 42UL) * 60UL + 25UL) * 1000UL, buf, sizeof(buf));
+   EXPECT(strcmp(buf, "3d 7h 42m 25s") == 0); // the requested example
+
+   // The "Energia" line has only FOUR indicators, in the fixed order, each one its OWN channel.
+   energyIndicators(makeState(true, false, false, false), buf, sizeof(buf));
+   EXPECT(strcmp(buf, "\xF0\x9F\x9F\xA2 \xE2\x9A\xAA \xE2\x9A\xAA \xE2\x9A\xAA") == 0); // rede on
+   energyIndicators(makeState(false, true, false, false), buf, sizeof(buf));
+   EXPECT(strcmp(buf, "\xE2\x9A\xAA \xF0\x9F\x94\xB5 \xE2\x9A\xAA \xE2\x9A\xAA") == 0); // rede de alimentacao on
+   energyIndicators(makeState(false, false, true, false), buf, sizeof(buf));
+   EXPECT(strcmp(buf, "\xE2\x9A\xAA \xE2\x9A\xAA \xF0\x9F\x9F\xA1 \xE2\x9A\xAA") == 0); // offgrid on
+   energyIndicators(makeState(false, false, false, true), buf, sizeof(buf));
+   EXPECT(strcmp(buf, "\xE2\x9A\xAA \xE2\x9A\xAA \xE2\x9A\xAA \xF0\x9F\x94\xB4") == 0); // gerador on
+   energyIndicators(makeState(true, true, true, true), buf, sizeof(buf));
+   EXPECT(strcmp(buf, "\xF0\x9F\x9F\xA2 \xF0\x9F\x94\xB5 \xF0\x9F\x9F\xA1 \xF0\x9F\x94\xB4") == 0); // all on
+   energyIndicators(makeState(false, false, false, false), buf, sizeof(buf));
+   EXPECT(strcmp(buf, "\xE2\x9A\xAA \xE2\x9A\xAA \xE2\x9A\xAA \xE2\x9A\xAA") == 0); // all off
+
+   // Whole message: a leading blank line, the version (a parameter), the uptime and the Energia line.
+   const uint32_t uptime = ((3UL * 24UL * 60UL + 7UL * 60UL + 42UL) * 60UL + 25UL) * 1000UL; // 3d 7h 42m 25s
+   const PowerState s = makeState(true, true, false, false);
+
+   char msg[512];
+   buildStatusMessage(s, "1.6.0", uptime, msg, sizeof(msg));
+
+   EXPECT(msg[0] == '\n'); // the first line is blank
+   EXPECT(strstr(msg, "\nFirmware: 1.6.0") != nullptr);
+   EXPECT(strstr(msg, "\n\nUptime: 3d 7h 42m 25s") != nullptr);
+   EXPECT(strstr(msg, "\n\nEnergia: \xF0\x9F\x9F\xA2 \xF0\x9F\x94\xB5 \xE2\x9A\xAA \xE2\x9A\xAA") != nullptr);
+   EXPECT(strstr(msg, "Estados atuais") == nullptr); // the textual listing is gone
+
+   // A different state flips exactly the matching indicators.
+   buildStatusMessage(makeState(false, false, true, true), "1.6.0", uptime, msg, sizeof(msg));
+   EXPECT(strstr(msg, "Energia: \xE2\x9A\xAA \xE2\x9A\xAA \xF0\x9F\x9F\xA1 \xF0\x9F\x94\xB4") != nullptr);
+
+   // The version is a parameter of the builder (the firmware passes FIRMWARE_VERSION).
+   buildStatusMessage(s, "9.9.9", uptime, msg, sizeof(msg));
+   EXPECT(strstr(msg, "Firmware: 9.9.9") != nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -703,6 +787,8 @@ int main() {
    testStickerPolicy();
    testStickerQueue();
    testStickerFlow();
+   testTgCommandParsing();
+   testStatusMessage();
 
    printf("\n%d verificacoes, %d falha(s)\n", checks, failures);
 
