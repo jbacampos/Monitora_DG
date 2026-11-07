@@ -231,25 +231,6 @@ struct PersistedState {
    // chronological order once no FALTA/RETORNO sequence is in flight. Persisted so a reboot never
    // loses a confirmed transition. Appended at the END to keep every earlier field offset.
    VisualQueue visualQueue{};
-
-   // Preventive deletion before the Telegram 48 h limit. For each tracked message the firmware
-   // keeps the CONFIRMED send instant (Unix seconds; 0 = unknown) and the earliest next attempt
-   // (Unix seconds; 0 = no gate), so the whole window survives a reboot. The per-message state is
-   // a MaintState (see tg_maint.h); it is stored as a raw uint8_t here so types.h stays free of
-   // that header.
-   uint32_t fallStickerSentEpoch = 0;
-   uint32_t fallStickerNextAttempt = 0;
-   uint8_t fallStickerMaint = 0;
-
-   uint32_t retStickerSentEpoch = 0;
-   uint32_t retStickerNextAttempt = 0;
-   uint8_t retStickerMaint = 0;
-
-   uint32_t visualSentEpoch = 0;
-   uint32_t visualNextAttempt = 0;
-   uint8_t visualMaint = 0;
-   // Set after the visual line was deleted preventively and a silent replacement must be sent.
-   uint8_t visualRenewPending = 0;
 };
 
 // Reason of a boot/reboot. The CODE is the STABLE value published (as a NUMBER) to ThingsBoard

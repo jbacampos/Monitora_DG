@@ -10,13 +10,12 @@
 //
 // On-flash format and migration
 // -----------------------------
-// Firmware 1.6.0 appended the visual snapshot queue and the preventive-deletion metadata at the
-// END of PersistedState. Every field that existed before keeps its offset and type, so a state.bin
-// written by an older firmware is an exact byte-prefix of the current layout. A known prefix size
-// is adopted by copying the prefix and leaving the new trailing fields at their safe defaults
-// (zeros => no preventive deletion is scheduled for messages sent before the upgrade, and the
-// visual queue starts empty). Any other size is treated as UNKNOWN and rejected: the image is
-// never partially interpreted (the caller keeps its defaults and logs a diagnostic).
+// Firmware 1.6.0 appended the visual snapshot queue at the END of PersistedState. Every field that
+// existed before keeps its offset and type, so a state.bin written by an older firmware is an
+// exact byte-prefix of the current layout. A known prefix size is adopted by copying the prefix and
+// leaving the new trailing fields at their safe defaults (the visual queue starts empty). Any other
+// size is treated as UNKNOWN and rejected: the image is never partially interpreted (the caller
+// keeps its defaults and logs a diagnostic).
 namespace StateMigration {
 
 // Historical sizes of PersistedState, oldest first (firmware 1.0.0 .. 1.5.0). Each is a prefix of

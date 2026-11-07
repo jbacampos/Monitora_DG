@@ -642,10 +642,9 @@ namespace {
    }
 
    // Sends ONE visual line per pass when Telegram is free. The line reflects a queued confirmed
-   // transition (the state captured at that transition) or, when nothing is queued, the silent
-   // preventive renewal of the current line. A FALTA/RETORNO sequence in flight (tgPhase != NONE)
-   // merely DEFERS the sends: the queue keeps every confirmed transition, sent in chronological
-   // order once the sequence finished.
+   // transition (the state captured at that transition). A FALTA/RETORNO sequence in flight
+   // (tgPhase != NONE) merely DEFERS the sends: the queue keeps every confirmed transition, sent
+   // in chronological order once the sequence finished.
    //
    // Exactly one visual message is kept: the previous one is deleted only AFTER the new one was
    // confirmed (its id is persisted first). A pending replacement deletion is resolved first and
@@ -683,19 +682,17 @@ namespace {
          }
       }
 
-      const VisualSendKind kind = visualNextSend(persisted.visualQueue.empty(), persisted.visualRenewPending != 0);
+      const VisualSendKind kind = visualNextSend(persisted.visualQueue.empty());
 
       if (kind == VisualSendKind::None) {
          return;
       }
 
-      const bool silent = (kind == VisualSendKind::SilentRenewal);
-      const PowerState line = (kind == VisualSendKind::RealChange) ? *persisted.visualQueue.front() : inputs.state();
+      const PowerState line = *persisted.visualQueue.front();
 
       int32_t messageId = 0;
-      uint32_t dateEpoch = 0;
 
-      if (telegram.sendText(visualLine(line), messageId, dateEpoch, silent) && messageId > 0) {
+      if (telegram.sendText(visualLine(line), messageId) && messageId > 0) {
          telegramRetryClear();
 
          const int32_t previousId = persisted.lastVisualMessageId;
@@ -705,21 +702,16 @@ namespace {
          persisted.lastVisualMessageId = messageId;
          persisted.visualDeletePendingId = (previousId > 0 && previousId != messageId) ? previousId : 0;
 
-         if (kind == VisualSendKind::RealChange) {
-            persisted.visualQueue.pop();
-         }
-
-         // A real change (or the renewal itself) satisfied any pending-renewal need.
-         persisted.visualRenewPending = 0;
+         persisted.visualQueue.pop();
 
          saveState();
 
          lastVisualState = line;
          visualStateKnown = true;
 
-         Serial.printf("[%lu] TG: LEDs enviados%s rede=%d alim_rede=%d offgrid=%d gerador=%d id=%ld pendentes=%u\n",
-                       static_cast<unsigned long>(millis()), silent ? " (renovacao silenciosa)" : "", line.redeDisponivel ? 1 : 0,
-                       line.alimentacaoRede ? 1 : 0, line.alimentacaoOffgrid ? 1 : 0, line.alimentacaoGerador ? 1 : 0, static_cast<long>(messageId),
+         Serial.printf("[%lu] TG: LEDs enviados rede=%d alim_rede=%d offgrid=%d gerador=%d id=%ld pendentes=%u\n",
+                       static_cast<unsigned long>(millis()), line.redeDisponivel ? 1 : 0, line.alimentacaoRede ? 1 : 0,
+                       line.alimentacaoOffgrid ? 1 : 0, line.alimentacaoGerador ? 1 : 0, static_cast<long>(messageId),
                        static_cast<unsigned>(persisted.visualQueue.count));
 
          // Replace the previous visual message. If the deletion fails, the id stays persisted and
@@ -922,15 +914,14 @@ namespace {
                     static_cast<unsigned long>(telegram.reuseStalls()), static_cast<unsigned long>(telegram.newConnections()));
 
       Serial.printf("DIAG up=%lus wifi=%d rssi=%d ntp=%d rede=%d pend=%lu head=%lu gap=%u tgPend=%d tgNotif=%d tgForce=%d tgPhase=%s tgStuck=%d "
-                    "fallId=%ld retId=%ld visId=%ld visDelId=%ld vq=%u vqDrop=%u renew=%d fallM=%d retM=%d visM=%d\n",
+                    "fallId=%ld retId=%ld visId=%ld visDelId=%ld vq=%u vqDrop=%u\n",
                     static_cast<unsigned long>(now / 1000UL), WiFi.status() == WL_CONNECTED ? 1 : 0, WiFi.RSSI(), timeSource.synced() ? 1 : 0,
                     persisted.power.redeDisponivel ? 1 : 0, static_cast<unsigned long>(count - persisted.tbLogHead),
                     static_cast<unsigned long>(persisted.tbLogHead), persisted.tbGapCount, persisted.tgPending ? 1 : 0, persisted.tgNotifiedRede ? 1 : 0,
                     persisted.tgForceNotify ? 1 : 0, phaseName(persisted.tgPhase), tgPhaseStuck ? 1 : 0, static_cast<long>(persisted.lastFallStickerId),
                     static_cast<long>(persisted.lastReturnStickerId), static_cast<long>(persisted.lastVisualMessageId),
                     static_cast<long>(persisted.visualDeletePendingId), static_cast<unsigned>(persisted.visualQueue.count),
-                    static_cast<unsigned>(persisted.visualQueue.dropped), persisted.visualRenewPending ? 1 : 0, persisted.fallStickerMaint,
-                    persisted.retStickerMaint, persisted.visualMaint);
+                    static_cast<unsigned>(persisted.visualQueue.dropped));
 
       Serial.printf("[%lu] BOOT DIAG: bootId=%ld bootDelId=%ld reason=%s\n", static_cast<unsigned long>(now),
                     static_cast<long>(persisted.lastBootMessageId), static_cast<long>(persisted.bootDeletePendingId),

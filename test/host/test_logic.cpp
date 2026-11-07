@@ -409,77 +409,138 @@ void testVisualQueue() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Real change vs silent renewal (ETAPA 2.4/2.5): a queued change always wins; the silent renewal
-// only goes out when nothing is queued.
+// ETAPA 1 visual decision: only a queued confirmed transition produces a line.
 // ---------------------------------------------------------------------------------------------
-void testVisualSendPriority() {
-   EXPECT(visualNextSend(false, true) == VisualSendKind::RealChange);
-   EXPECT(visualNextSend(false, false) == VisualSendKind::RealChange);
-   EXPECT(visualNextSend(true, true) == VisualSendKind::SilentRenewal);
-   EXPECT(visualNextSend(true, false) == VisualSendKind::None);
+void testVisualSendDecision() {
+   EXPECT(visualNextSend(false) == VisualSendKind::RealChange); // queue non-empty
+   EXPECT(visualNextSend(true) == VisualSendKind::None);        // queue empty
 }
 
 // ---------------------------------------------------------------------------------------------
-// state.bin migration: an older image is an exact byte-prefix of the current layout. Every field
-// that existed before is preserved and the appended fields stay at their safe defaults. An unknown
-// size is rejected (never partially interpreted).
+// state.bin migration: an older image is an exact byte-prefix of the current layout (fields were
+// only ever appended). The historical layouts 60/68/76/84 bytes are REAL fixtures: the byte prefix
+// of a fully populated PersistedState IS the old on-flash layout. Each fixture is adopted into the
+// current 120-byte layout and every field that existed before it is preserved, while the fields
+// introduced later start at their safe defaults and the ETAPA-1 visual queue starts empty. An
+// unknown size is rejected (never partially interpreted).
 // ---------------------------------------------------------------------------------------------
 void testStateMigration() {
-   PersistedState original{};
-   original.validReliable = true;
-   original.power = makeState(false, false, true, false);
-   original.tbLogHead = 0x01020304u;
-   original.tbGapCount = 7;
-   original.lastFallStickerId = 4242;
-   original.lastVisualMessageId = 777;
-   original.lastBootMessageId = 888;
-   original.tgPhase = TG_PHASE_TEXT_RET;
-   original.bootDeletePendingId = 55;
+   const size_t sizes[4] = {60, 68, 76, 84};
 
-   // The first 84 bytes of the current struct ARE the 1.5.0 layout (fields were only appended), so
-   // this is a faithful fixture of the previous firmware's state.bin.
-   uint8_t legacy[84];
-   memcpy(legacy, &original, sizeof(legacy));
+   EXPECT(sizeof(PersistedState) == 120);
 
-   EXPECT(StateMigration::isLegacySize(60));
-   EXPECT(StateMigration::isLegacySize(68));
-   EXPECT(StateMigration::isLegacySize(76));
-   EXPECT(StateMigration::isLegacySize(84));
-   EXPECT(!StateMigration::isLegacySize(85));
+   for (size_t s = 0; s < 4; ++s) {
+      const size_t size = sizes[s];
+      const int fixtureFailures = failures;
+
+      // Populate a full current-state image; the first `size` bytes are the historical layout.
+      PersistedState full{};
+      full.validReliable = true;
+      full.power = makeState(true, false, false, true);
+      full.alive.timestamp.kind = TsKind::Epoch;
+      full.alive.timestamp.value = 111;
+      full.alive.redeDisponivel = true;
+      full.lastFallStickerId = 222;
+      full.lastReturnStickerId = 333;
+      full.tgNotifiedRede = true;
+      full.tgPending = true;
+      full.tgForceNotify = true;
+      full.tgTimestamp.kind = TsKind::Epoch;
+      full.tgTimestamp.value = 444;
+      full.tgPhase = TG_PHASE_TEXT_RET;
+      full.tgAdjectiveIndex = 5;
+      full.tgVerbIndex = 6;
+      full.redeFailGraceActive = true;
+      full.redeFailStarted.value = 555;
+      full.tbLogHead = 0x0102;
+      full.tbGapCount = 3;
+      full.tgUpdateOffset = 999;
+      full.pendingBootReason = BOOT_REASON_OTA;
+      full.otaRequested = true;
+      full.lastVisualMessageId = 777;
+      full.visualDeletePendingId = 888;
+      full.lastBootMessageId = 999;
+      full.bootDeletePendingId = 1010;
+
+      uint8_t fixture[84];
+      memcpy(fixture, &full, size);
+
+      EXPECT(StateMigration::isLegacySize(size));
+
+      // Poison the whole destination to prove the adoption reinitialises it.
+      PersistedState m{};
+      memset(reinterpret_cast<uint8_t *>(&m), 0xAA, sizeof(m));
+
+      EXPECT(StateMigration::adopt(fixture, size, m));
+
+      // Fields present in EVERY historical layout (< 60 bytes): always preserved.
+      EXPECT(m.validReliable);
+      EXPECT_STATE(m.power, true, false, false, true);
+      EXPECT(m.alive.redeDisponivel);
+      EXPECT(m.alive.timestamp.value == 111);
+      EXPECT(m.lastFallStickerId == 222);
+      EXPECT(m.lastReturnStickerId == 333);
+      EXPECT(m.tgNotifiedRede);
+      EXPECT(m.tgPending);
+      EXPECT(m.tgForceNotify);
+      EXPECT(m.tgPhase == TG_PHASE_TEXT_RET);
+      EXPECT(m.tgAdjectiveIndex == 5);
+      EXPECT(m.tgVerbIndex == 6);
+      EXPECT(m.redeFailGraceActive);
+      EXPECT(m.tbLogHead == 0x0102);
+      EXPECT(m.tbGapCount == 3);
+
+      // tgUpdateOffset / pendingBootReason / otaRequested exist from 68 bytes on.
+      if (size >= 68) {
+         EXPECT(m.tgUpdateOffset == 999);
+         EXPECT(m.pendingBootReason == BOOT_REASON_OTA);
+         EXPECT(m.otaRequested);
+      } else {
+         EXPECT(m.tgUpdateOffset == 0);
+         EXPECT(m.pendingBootReason == BOOT_REASON_NONE);
+         EXPECT(!m.otaRequested);
+      }
+
+      // The visual-line ids exist from 76 bytes on.
+      if (size >= 76) {
+         EXPECT(m.lastVisualMessageId == 777);
+         EXPECT(m.visualDeletePendingId == 888);
+      } else {
+         EXPECT(m.lastVisualMessageId == 0);
+         EXPECT(m.visualDeletePendingId == 0);
+      }
+
+      // The reboot-notice ids exist from 84 bytes on.
+      if (size >= 84) {
+         EXPECT(m.lastBootMessageId == 999);
+         EXPECT(m.bootDeletePendingId == 1010);
+      } else {
+         EXPECT(m.lastBootMessageId == 0);
+         EXPECT(m.bootDeletePendingId == 0);
+      }
+
+      // The ETAPA-1 visual queue is always initialised empty (no artificial line).
+      EXPECT(m.visualQueue.empty());
+      EXPECT(m.visualQueue.count == 0);
+      EXPECT(m.visualQueue.dropped == 0);
+
+      printf("  migracao %2u B -> %u B: %s\n", static_cast<unsigned>(size), static_cast<unsigned>(sizeof(PersistedState)),
+             (failures == fixtureFailures) ? "OK" : "FALHOU");
+   }
+
+   // The current size is accepted. 156 (an abandoned format that was never installed) and any
+   // other size are rejected: the image is never partially interpreted.
    EXPECT(StateMigration::isKnownSize(sizeof(PersistedState)));
+   EXPECT(!StateMigration::isKnownSize(156));
    EXPECT(!StateMigration::isKnownSize(85));
    EXPECT(!StateMigration::isKnownSize(sizeof(PersistedState) + 1));
 
-   // Poison the appended fields to prove the migration zeroes them.
-   PersistedState migrated{};
-   migrated.fallStickerMaint = 9;
-   migrated.visualRenewPending = 9;
-   migrated.visualSentEpoch = 0xDEADBEEFu;
-
-   EXPECT(StateMigration::adopt(legacy, 84, migrated));
-
-   // Every field inside the first 84 bytes is preserved.
-   EXPECT(migrated.validReliable);
-   EXPECT_STATE(migrated.power, false, false, true, false);
-   EXPECT(migrated.tbLogHead == 0x01020304u);
-   EXPECT(migrated.tbGapCount == 7);
-   EXPECT(migrated.lastFallStickerId == 4242);
-   EXPECT(migrated.lastVisualMessageId == 777);
-   EXPECT(migrated.lastBootMessageId == 888);
-   EXPECT(migrated.tgPhase == TG_PHASE_TEXT_RET);
-   EXPECT(migrated.bootDeletePendingId == 55);
-
-   // The appended fields are safe defaults: no artificial deletion, empty visual queue.
-   EXPECT(migrated.visualQueue.empty());
-   EXPECT(migrated.fallStickerSentEpoch == 0);
-   EXPECT(migrated.fallStickerNextAttempt == 0);
-   EXPECT(migrated.fallStickerMaint == 0);
-   EXPECT(migrated.visualSentEpoch == 0);
-   EXPECT(migrated.visualRenewPending == 0);
-
-   // An unknown size is rejected and never partially interpreted.
+   uint8_t junk[84] = {0};
    PersistedState untouched{};
-   EXPECT(!StateMigration::adopt(legacy, 85, untouched));
+
+   EXPECT(!StateMigration::adopt(junk, 156, untouched));
+   EXPECT(!StateMigration::adopt(junk, 85, untouched));
+   EXPECT(!StateMigration::adopt(junk, 60 + 1, untouched));
 }
 
 } // namespace
@@ -493,7 +554,7 @@ int main() {
    testTimestamps();
    testContradictions();
    testVisualQueue();
-   testVisualSendPriority();
+   testVisualSendDecision();
    testStateMigration();
 
    printf("\n%d verificacoes, %d falha(s)\n", checks, failures);

@@ -41,7 +41,7 @@ include/
   telemetry.h         MQTT/TLS, fila historica, snapshot de boot, heartbeat
   telegram.h          API HTTP de baixo nivel do Telegram
   telegram_notifier.h coalescimento, stickers e textos
-  tg_maint.h          fila visual + politica de exclusao preventiva (pura, testavel no host)
+  tg_maint.h          decisao de envio da fila visual (pura, testavel no host)
   wifi_manager.h      conectividade
   ota.h               /ota
   secrets.h.example   credenciais (copie para secrets.h)
@@ -55,14 +55,13 @@ test/
 
 - `/state.bin` = um unico `PersistedState`, escrito em `/state.tmp` e depois `rename`
   (o rename do LittleFS substitui o destino de forma atomica). Sem CRC e sem slots A/B.
-  A versao 1.6.0 acrescentou no **fim** da struct a fila de fotografias visuais (`visualQueue`)
-  e os metadados da exclusao preventiva; todos os campos anteriores mantem offset e tipo, entao
-  um `state.bin` antigo e um **prefixo** exato do atual. Tamanhos reconhecidos: 60/68/76/84
-  (1.0.0..1.5.0) e o atual (156). `StateStore::load()` adota o prefixo (os campos novos ficam nos
-  valores seguros = zero: nenhuma exclusao e agendada para mensagens enviadas antes da
-  atualizacao), grava a migracao de forma **atomica** (temp + rename; o original e preservado ate
-  o rename) e recusa qualquer tamanho **desconhecido** com diagnostico explicito (um arquivo
-  parcial nunca e interpretado como estado valido).
+  A versao 1.6.0 acrescentou no **fim** da struct a fila de fotografias visuais (`visualQueue`);
+  todos os campos anteriores mantem offset e tipo, entao um `state.bin` antigo e um **prefixo**
+  exato do atual. Tamanhos reconhecidos: 60/68/76/84 (1.0.0..1.5.0) e o atual (120).
+  `StateStore::load()` adota o prefixo (os campos novos ficam nos valores seguros = zero: a fila
+  visual comeca vazia), grava a migracao de forma **atomica** (temp + rename; o original e
+  preservado ate o rename) e recusa qualquer tamanho **desconhecido** com diagnostico explicito
+  (um arquivo parcial nunca e interpretado como estado valido).
 - `/pending.bin` = log **append-only** de `PendingRecord` (16 B: `Timestamp` 8 + `PowerState`
   4 + `rebootReason` 1 + 3 de alinhamento), precedido por um cabecalho de formato de 4 B
   (`PENDING_MAGIC`). O `tbLogHead` (em `state.bin`) aponta o proximo registro a publicar. O

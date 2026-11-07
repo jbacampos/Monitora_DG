@@ -7,9 +7,7 @@ Campos do `DIAG`: `up` (uptime s), `wifi`, `rssi`, `ntp`, `rede`, `pend` (n pend
 `head`, `gap` (tbGapCount), `tgPend`, `tgNotif`, `tgForce`, `tgPhase`, `tgStuck` (fase sem
 progresso ha mais de `TELEGRAM_PHASE_STUCK_MS`), `fallId`, `retId`,
 `visId` (id da atual mensagem visual), `visDelId` (id aguardando exclusao, 0 = nenhum),
-`vq` (fotografias na fila visual), `vqDrop` (coalescidas por overflow), `renew` (renovacao
-silenciosa pendente), `fallM`/`retM`/`visM` (estado da exclusao preventiva: 0=none 1=waiting
-2=done 3=expired).
+`vq` (fotografias na fila visual), `vqDrop` (coalescidas por overflow).
 Na linha `BOOT DIAG` adicional: `bootId` (id da atual mensagem de reinicio), `bootDelId` (id de
 reinicio aguardando exclusao, 0 = nenhum), `reason` (motivo do boot, igual ao da mensagem).
 
