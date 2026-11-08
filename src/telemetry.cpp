@@ -5,8 +5,8 @@
 #include <WiFiClientSecure.h>
 
 #include "config.h"
+#include "credentials.h"
 #include "heap_diag.h"
-#include "secrets.h"
 
 namespace {
    WiFiClientSecure tlsClient;
@@ -45,9 +45,16 @@ bool Telemetry::connectMqtt() {
       return false;
    }
 
+   // A blank selected token (TEST_MODE=true with TB_ACCESS_TOKEN_TEST not filled in yet) must
+   // never open a session: an empty access token can only fail, and refusing explicitly makes the
+   // missing credential obvious instead of looking like a transient network problem.
+   if (ACTIVE_TB_ACCESS_TOKEN[0] == '\0') {
+      return false;
+   }
+
    const String clientId = String(DEVICE_ID) + "-" + String(ESP.getChipId(), HEX);
 
-   if (mqtt.connect(clientId.c_str(), TB_ACCESS_TOKEN, nullptr)) {
+   if (mqtt.connect(clientId.c_str(), ACTIVE_TB_ACCESS_TOKEN, nullptr)) {
       connected_ = true;
       heapDiag("evento:mqtt-conectado");
       return true;

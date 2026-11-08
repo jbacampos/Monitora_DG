@@ -10,6 +10,22 @@ constexpr char FIRMWARE_VERSION[] = "1.6.1";
 constexpr char DEVICE_ID[] = "DG-01";
 
 // -----------------------------------------------------------------------------
+// Test mode - the SINGLE switch for the whole test/production routing
+//
+// Changing ONLY this value selects, in one place, which credentials and
+// destinations EVERY Telegram and ThingsBoard communication uses:
+//   false -> production (Telegram production group / production ThingsBoard device)
+//   true  -> test       (Telegram test group / "Teste MQTT" ThingsBoard device)
+//
+// The communication modules never choose an environment themselves: they consume
+// the ACTIVE_* constants defined in credentials.h, which are derived from this
+// flag. Nothing has to be commented/uncommented anywhere else. The GitHub token
+// used by /ota (TELEGRAM_REPO_TOKEN) is INDEPENDENT of this flag.
+// -----------------------------------------------------------------------------
+
+constexpr bool TEST_MODE = true; // true = test, false = production
+
+// -----------------------------------------------------------------------------
 // GPIOs - ESP8266 NodeMCU
 //
 // All four inputs are treated LOGICALLY as ACTIVE-HIGH. The physical wiring may
@@ -144,6 +160,13 @@ constexpr char STATE_FILE[]   = "/state.bin";
 constexpr char STATE_TMP[]    = "/state.tmp";
 constexpr char PENDING_FILE[] = "/pending.bin";
 constexpr char PENDING_TMP[]  = "/pending.tmp";
+
+// 1-byte file holding the environment tag (see env_tag.h / credentials.h) of the records
+// currently on flash. Rewritten at every boot; a mismatch with the active environment fences
+// the stored ThingsBoard queue and the Telegram ids/offsets from the new destination, so data
+// written under one environment can never reach the other. It is a separate file on purpose:
+// neither state.bin nor pending.bin changes layout, so this is migration-compatible.
+constexpr char ENV_TAG_FILE[] = "/env.tag";
 
 // Approximate budget for the ThingsBoard append-only log (~512 KB).
 constexpr uint32_t TB_LOG_BUDGET_BYTES = 512UL * 1024UL;

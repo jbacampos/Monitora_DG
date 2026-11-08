@@ -5,8 +5,8 @@
 #include <WiFiClientSecure.h>
 
 #include "config.h"
+#include "credentials.h"
 #include "heap_diag.h"
-#include "secrets.h"
 #include "tg_commands.h"
 
 namespace {
@@ -589,7 +589,7 @@ bool Telegram::request(
    }
 
    const String path =
-      "/bot" + String(TELEGRAM_BOT_TOKEN) +
+      "/bot" + String(ACTIVE_TELEGRAM_BOT_TOKEN) +
       "/" + method +
       (query.isEmpty() ? "" : "?" + query);
 
@@ -723,7 +723,7 @@ bool Telegram::sendMessageInternal(const String &message, int32_t *outId, bool d
    String response;
 
    String query =
-      "chat_id=" + urlEncode(TELEGRAM_CHAT_ID) +
+      "chat_id=" + urlEncode(ACTIVE_TELEGRAM_CHAT_ID) +
       "&text=" + urlEncode(message) +
       "&parse_mode=HTML";
 
@@ -753,7 +753,7 @@ bool Telegram::sendMessageInternal(const String &message, int32_t *outId, bool d
       // Diagnostic-only: the exact chat the message went to and the id that will later be
       // deleted (chat_id is not the token).
       Serial.printf("[%lu] TG: sendMessage chat_id=%s result.message_id=%ld silent=%d\n", static_cast<unsigned long>(millis()),
-                    TELEGRAM_CHAT_ID, static_cast<long>(*outId), disableNotification ? 1 : 0);
+                    ACTIVE_TELEGRAM_CHAT_ID, static_cast<long>(*outId), disableNotification ? 1 : 0);
    }
 
    return true;
@@ -771,7 +771,7 @@ bool Telegram::sendSticker(const String &stickerId, int32_t &messageId, uint32_t
    String response;
 
    const String query =
-      "chat_id=" + urlEncode(TELEGRAM_CHAT_ID) +
+      "chat_id=" + urlEncode(ACTIVE_TELEGRAM_CHAT_ID) +
       "&sticker=" + urlEncode(stickerId);
 
    if (!request("sendSticker", query, response)) {
@@ -795,7 +795,7 @@ bool Telegram::sendSticker(const String &stickerId, int32_t &messageId, uint32_t
 
    // Diagnostic-only: the exact chat the sticker went to and the id that feeds
    // lastFallStickerId / lastReturnStickerId in TelegramNotifier (chat_id is not the token).
-   Serial.printf("[%lu] TG: sendSticker chat_id=%s result.message_id=%ld date=%lu\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
+   Serial.printf("[%lu] TG: sendSticker chat_id=%s result.message_id=%ld date=%lu\n", static_cast<unsigned long>(millis()), ACTIVE_TELEGRAM_CHAT_ID,
                  static_cast<long>(messageId), static_cast<unsigned long>(dateEpoch));
 
    return messageId > 0;
@@ -811,7 +811,7 @@ Telegram::EditResult Telegram::editMessageText(int32_t messageId, const String &
    String response;
 
    const String query =
-      "chat_id=" + urlEncode(TELEGRAM_CHAT_ID) +
+      "chat_id=" + urlEncode(ACTIVE_TELEGRAM_CHAT_ID) +
       "&message_id=" + String(messageId) +
       "&text=" + urlEncode(text) +
       "&parse_mode=HTML";
@@ -871,11 +871,11 @@ Telegram::DeleteResult Telegram::deleteMessage(int32_t messageId) {
    String response;
 
    const String query =
-      "chat_id=" + urlEncode(TELEGRAM_CHAT_ID) +
+      "chat_id=" + urlEncode(ACTIVE_TELEGRAM_CHAT_ID) +
       "&message_id=" + String(messageId);
 
    // Diagnostic-only: the exact target of this deletion (chat_id is not the token).
-   Serial.printf("[%lu] TG: deleteMessage envio chat_id=%s message_id=%ld\n", static_cast<unsigned long>(millis()), TELEGRAM_CHAT_ID,
+   Serial.printf("[%lu] TG: deleteMessage envio chat_id=%s message_id=%ld\n", static_cast<unsigned long>(millis()), ACTIVE_TELEGRAM_CHAT_ID,
                  static_cast<long>(messageId));
 
    if (!request("deleteMessage", query, response)) {
@@ -973,7 +973,7 @@ void Telegram::processUpdates(const String &response) {
       // every message would be dropped by the check below.
       const long long chatId = update["message"]["chat"]["id"] | 0LL;
 
-      if (chatId != strtoll(TELEGRAM_CHAT_ID, nullptr, 10)) {
+      if (chatId != strtoll(ACTIVE_TELEGRAM_CHAT_ID, nullptr, 10)) {
          continue;
       }
 

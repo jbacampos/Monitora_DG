@@ -1,11 +1,12 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <LittleFS.h>
 
 #include "config.h"
+#include "credentials.h"
 #include "heap_diag.h"
 #include "input_monitor.h"
 #include "ota.h"
-#include "secrets.h"
 #include "state_store.h"
 #include "status_msg.h"
 #include "sticker_maint.h"
@@ -1099,6 +1100,93 @@ namespace {
                     static_cast<long>(persisted.lastBootMessageId), static_cast<long>(persisted.bootDeletePendingId),
                     rebootReasonDescription(bootReasonCode));
    }
+
+   // ---------------------------------------------------------------------------
+   // Environment (test/production) fence
+   //
+   // The record stores are shared by both environments. A 1-byte tag (ENV_TAG_FILE) records which
+   // environment wrote them; when it does not match the active one, the stores belong to the OTHER
+   // destination and must not be consumed here (a test record must never reach the production
+   // ThingsBoard, and a production Telegram message id must never be operated in the test group).
+   // Nothing is discarded silently: the reset is logged with the number of dropped records.
+   // ---------------------------------------------------------------------------
+
+   uint8_t readEnvTag() {
+      File file = LittleFS.open(ENV_TAG_FILE, "r");
+
+      if (!file) {
+         return ENV_TAG_NONE;
+      }
+
+      uint8_t tag = ENV_TAG_NONE;
+      const size_t readBytes = file.read(&tag, 1);
+      file.close();
+
+      return (readBytes == 1) ? tag : ENV_TAG_NONE;
+   }
+
+   void writeEnvTag(uint8_t tag) {
+      File file = LittleFS.open(ENV_TAG_FILE, "w");
+
+      if (!file) {
+         return;
+      }
+
+      file.write(&tag, 1);
+      file.flush();
+      file.close();
+   }
+
+   // Clears everything that belongs to the OTHER environment: the ThingsBoard history and every
+   // persisted Telegram id/offset/queue. Called only on an environment change.
+   void resetCrossEnvironmentStore() {
+      const uint32_t pending = tbQueue.count() - persisted.tbLogHead;
+
+      // ThingsBoard history: it was written for the other device.
+      tbQueue.reset();
+      persisted.tbLogHead = 0;
+      persisted.tbGapCount = 0;
+      lastSavedHead = 0;
+
+      // Telegram: every persisted id refers to a message in the other chat/bot.
+      persisted.tgUpdateOffset = 0;
+      persisted.tgPending = false;
+      persisted.tgNotifiedRede = false;
+      persisted.tgForceNotify = false;
+      persisted.tgPhase = TG_PHASE_NONE;
+      persisted.lastVisualMessageId = 0;
+      persisted.visualDeletePendingId = 0;
+      persisted.lastBootMessageId = 0;
+      persisted.bootDeletePendingId = 0;
+      persisted.lastFallStickerId = 0;
+      persisted.lastReturnStickerId = 0;
+      persisted.visualQueue = VisualQueue{};
+      persisted.fallMaint = StickerEvent{};
+      persisted.returnMaint = StickerEvent{};
+      persisted.editQueue = StickerEditQueue{};
+
+      saveState();
+
+      Serial.printf("[%lu] ENV: ambiente mudou; %lu registro(s) TB pendentes e os ids Telegram do ambiente "
+                    "anterior foram descartados (log explicito, nao silencioso).\n",
+                    static_cast<unsigned long>(millis()), static_cast<unsigned long>(pending));
+   }
+
+   // Fences the stores against the active environment. A store with no tag yet (first boot after
+   // this feature, or a fresh device) is adopted without a reset, so the upgrade never discards
+   // existing data; the tag is then written for the next boot.
+   void applyEnvironmentTag() {
+      const uint8_t stored = readEnvTag();
+
+      if (envTagConflicts(stored, ACTIVE_ENV_TAG)) {
+         resetCrossEnvironmentStore();
+      } else if (stored == ENV_TAG_NONE) {
+         Serial.printf("[%lu] ENV: tag de ambiente ausente (migracao); adotando tag=%u sem descartar dados.\n",
+                       static_cast<unsigned long>(millis()), static_cast<unsigned>(ACTIVE_ENV_TAG));
+      }
+
+      writeEnvTag(ACTIVE_ENV_TAG);
+   }
 } // namespace
 
 void setup() {
@@ -1160,6 +1248,10 @@ void setup() {
    } else {
       Serial.println("Sem estado persistente (primeira inicializacao).");
    }
+
+   // Environment (test/production) fence: must run AFTER the state is loaded and BEFORE any
+   // service starts (telegram.begin() consumes the selected bot/chat and the Telegram offset).
+   applyEnvironmentTag();
 
    heapDiag("setup:pos-load");
 

@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "env_tag.h"
 #include "input_group.h"
 #include "ota_asset.h"
 #include "state_store.h"
@@ -847,6 +848,31 @@ void testAssetSelection() {
    EXPECT(!selectAssetUrl(nullptr, nullptr, 0, "Monitora_DG.bin", out, sizeof(out)));
 }
 
+// ---------------------------------------------------------------------------------------------
+// Test/production routing: the single TEST_MODE switch must select EXCLUSIVELY one environment,
+// and the environment tag must fence cross-environment data (while never discarding a store that
+// has no tag yet, so the upgrade is safe).
+// ---------------------------------------------------------------------------------------------
+void testEnvironmentSelection() {
+   // selectCredential(): TEST_MODE=false -> production, true -> test, never both at once.
+   EXPECT(strcmp(selectCredential(false, "PROD", "TEST"), "PROD") == 0);
+   EXPECT(strcmp(selectCredential(true, "PROD", "TEST"), "TEST") == 0);
+
+   // The environment tag follows the same single switch and the two environments never collide.
+   EXPECT(envTagForMode(false) == ENV_TAG_PROD);
+   EXPECT(envTagForMode(true) == ENV_TAG_TEST);
+   EXPECT(envTagForMode(false) != envTagForMode(true));
+
+   // A store written under the other environment conflicts; the same one does not; an untagged
+   // (legacy / fresh) store is adopted without a conflict, so migration never discards data.
+   EXPECT(envTagConflicts(ENV_TAG_PROD, ENV_TAG_TEST));
+   EXPECT(envTagConflicts(ENV_TAG_TEST, ENV_TAG_PROD));
+   EXPECT(!envTagConflicts(ENV_TAG_PROD, ENV_TAG_PROD));
+   EXPECT(!envTagConflicts(ENV_TAG_TEST, ENV_TAG_TEST));
+   EXPECT(!envTagConflicts(ENV_TAG_NONE, ENV_TAG_PROD));
+   EXPECT(!envTagConflicts(ENV_TAG_NONE, ENV_TAG_TEST));
+}
+
 } // namespace
 
 int main() {
@@ -867,6 +893,7 @@ int main() {
    testStatusMessage();
    testBootReason();
    testAssetSelection();
+   testEnvironmentSelection();
 
    printf("\n%d verificacoes, %d falha(s)\n", checks, failures);
 
