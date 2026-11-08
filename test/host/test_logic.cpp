@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "input_group.h"
+#include "ota_asset.h"
 #include "state_store.h"
 #include "status_msg.h"
 #include "sticker_maint.h"
@@ -427,11 +428,11 @@ void testVisualSendDecision() {
 // introduced later start at their safe defaults. An unknown size is rejected.
 // ---------------------------------------------------------------------------------------------
 void testStateMigration() {
-   const size_t sizes[5] = {60, 68, 76, 84, 120};
+   const size_t sizes[6] = {60, 68, 76, 84, 120, 636};
 
-   EXPECT(sizeof(PersistedState) == 636);
+   EXPECT(sizeof(PersistedState) == 764);
 
-   for (size_t s = 0; s < 5; ++s) {
+   for (size_t s = 0; s < 6; ++s) {
       const size_t size = sizes[s];
       const int fixtureFailures = failures;
 
@@ -467,7 +468,7 @@ void testStateMigration() {
       full.visualQueue.push(makeState(false, false, true, false));
       full.visualQueue.push(makeState(true, true, false, false));
 
-      uint8_t fixture[120];
+      uint8_t fixture[sizeof(PersistedState)];
       memcpy(fixture, &full, size);
 
       EXPECT(StateMigration::isLegacySize(size));
@@ -543,6 +544,10 @@ void testStateMigration() {
       EXPECT(m.returnMaint.state == 0);
       EXPECT(m.editQueue.empty());
       EXPECT(m.editQueue.count == 0);
+
+      // The asset URL (appended after 636) always starts EMPTY: an upgraded image never carries a
+      // stale download endpoint, and the OTA boot aborts explicitly when it is missing.
+      EXPECT(m.otaAssetUrl[0] == 0);
 
       printf("  migracao %3u B -> %u B: %s\n", static_cast<unsigned>(size), static_cast<unsigned>(sizeof(PersistedState)),
              (failures == fixtureFailures) ? "OK" : "FALHOU");
@@ -802,6 +807,46 @@ void testBootReason() {
    EXPECT(strstr(rebootReasonDescription(REBOOT_REASON_OTA), "/ota") != nullptr);
 }
 
+// ---------------------------------------------------------------------------------------------
+// OTA asset selection: /ota must pick EXCLUSIVELY the asset named Monitora_DG.bin, once only and by
+// exact match. Missing, ambiguous, empty-URL or oversized-URL cases are all rejected so the caller
+// aborts the update instead of downloading the wrong asset.
+// ---------------------------------------------------------------------------------------------
+void testAssetSelection() {
+   const char *names[] = {"readme.txt", "Monitora_DG.bin", "extra.bin"};
+   const char *urls[] = {"https://example/readme", "https://api.github.com/repos/o/r/releases/assets/7", "https://example/extra"};
+   char out[OTA_ASSET_URL_MAX];
+
+   // Exactly one match -> its URL is copied verbatim.
+   EXPECT(selectAssetUrl(names, urls, 3, "Monitora_DG.bin", out, sizeof(out)));
+   EXPECT(strcmp(out, "https://api.github.com/repos/o/r/releases/assets/7") == 0);
+
+   // A different wanted name is absent -> false.
+   EXPECT(!selectAssetUrl(names, urls, 3, "other.bin", out, sizeof(out)));
+
+   // Ambiguous: two assets share the wanted name -> false (never pick one arbitrarily).
+   const char *dupNames[] = {"Monitora_DG.bin", "Monitora_DG.bin"};
+   const char *dupUrls[] = {"https://a", "https://b"};
+   EXPECT(!selectAssetUrl(dupNames, dupUrls, 2, "Monitora_DG.bin", out, sizeof(out)));
+
+   // The match carries an empty URL -> treated as absent.
+   const char *emptyNames[] = {"Monitora_DG.bin"};
+   const char *emptyUrls[] = {""};
+   EXPECT(!selectAssetUrl(emptyNames, emptyUrls, 1, "Monitora_DG.bin", out, sizeof(out)));
+
+   // Exact match only: a superstring name is NOT accepted.
+   const char *nearNames[] = {"Monitora_DG.bin.gz"};
+   const char *nearUrls[] = {"https://example/x"};
+   EXPECT(!selectAssetUrl(nearNames, nearUrls, 1, "Monitora_DG.bin", out, sizeof(out)));
+
+   // The URL must fit (outSize includes the terminating NUL).
+   char tiny[8];
+   EXPECT(!selectAssetUrl(names, urls, 3, "Monitora_DG.bin", tiny, sizeof(tiny)));
+
+   // No assets at all (null arrays) -> false.
+   EXPECT(!selectAssetUrl(nullptr, nullptr, 0, "Monitora_DG.bin", out, sizeof(out)));
+}
+
 } // namespace
 
 int main() {
@@ -821,6 +866,7 @@ int main() {
    testTgCommandParsing();
    testStatusMessage();
    testBootReason();
+   testAssetSelection();
 
    printf("\n%d verificacoes, %d falha(s)\n", checks, failures);
 

@@ -5,10 +5,14 @@
 #include <ESP8266httpUpdate.h>
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
+#include <umm_malloc/umm_heap_select.h>
 
 #include "config.h"
+#include "heap_diag.h"
+#include "ota_asset.h"
 #include "secrets.h"
 #include "time_source.h"
+#include "types.h"
 
 namespace {
    // ---------------------------------------------------------------------------
@@ -137,6 +141,73 @@ namespace {
    constexpr char HDR_RATE_REMAINING[] = "X-RateLimit-Remaining";
    constexpr char HDR_RATE_RESET[]     = "X-RateLimit-Reset";
    constexpr char HDR_RETRY_AFTER[]    = "Retry-After";
+
+   // Resolves the STABLE API URL of the release asset named OTA_ASSET_NAME from the /releases/latest
+   // `assets` array into `assetUrl`. Leaves it EMPTY when the asset is absent, ambiguous, has no URL
+   // or the URL does not fit. The exact/unique-match rule lives in the pure selectAssetUrl()
+   // (ota_asset.h), covered by the host tests.
+   void resolveAssetUrl(JsonArray assets, String &assetUrl) {
+      constexpr size_t kMaxAssets = 8;
+      const char *names[kMaxAssets];
+      const char *urls[kMaxAssets];
+      size_t count = 0;
+
+      for (JsonObject asset : assets) {
+         if (count >= kMaxAssets) {
+            break;
+         }
+
+         names[count] = asset["name"].as<const char *>();
+         urls[count] = asset["url"].as<const char *>();
+         ++count;
+      }
+
+      char buffer[OTA_ASSET_URL_MAX];
+
+      if (selectAssetUrl(names, urls, count, OTA_ASSET_NAME, buffer, sizeof(buffer))) {
+         assetUrl = buffer;
+      }
+   }
+
+   // Complementary OTA heap guard threshold (see run()): below this largest free block the TLS
+   // handshake's THROWING allocations (br_ssl_client_context ~3424 B + br_x509_insecure_context
+   // ~1496 B) are at risk and this core would panic instead of failing gracefully.
+   constexpr uint32_t OTA_TLS_MIN_BLOCK = 4096;
+
+   // Diagnostic-only: free heap + largest block for the CURRENT heap and for DRAM and IRAM
+   // SEPARATELY. HeapSelect{...} swaps the allocator's current heap and restores it on scope exit
+   // (RAII), so nothing leaks; no allocation is attempted (pure read).
+   void logOtaMem(const char *label) {
+      const uint32_t freeCur = ESP.getFreeHeap();
+      const uint32_t blockCur = ESP.getMaxFreeBlockSize();
+
+      uint32_t freeDram = 0;
+      uint32_t blockDram = 0;
+      uint32_t freeIram = 0;
+      uint32_t blockIram = 0;
+
+      {
+         HeapSelectDram dram;
+         freeDram = ESP.getFreeHeap();
+         blockDram = ESP.getMaxFreeBlockSize();
+      }
+
+      {
+         HeapSelectIram iram;
+         freeIram = ESP.getFreeHeap();
+         blockIram = ESP.getMaxFreeBlockSize();
+      }
+
+      Serial.printf("[%lu] OTA MEM %s: cur=%u/%u dram=%u/%u iram=%u/%u (free/maxblock)\n", static_cast<unsigned long>(millis()), label, freeCur, blockCur,
+                    freeDram, blockDram, freeIram, blockIram);
+   }
+
+   // Diagnostic-only: shared state for the ESPhttpUpdate/Updater callbacks registered in run(). The
+   // client pointer is set immediately BEFORE update() and cleared immediately AFTER it returns, so a
+   // callback can never dereference a destroyed client and no dangling pointer is left behind.
+   WiFiClientSecure *g_otaClient = nullptr;
+   uint32_t g_otaStartMs = 0;
+   uint32_t g_otaLastLogged = 0;
 } // namespace
 
 bool Ota::begin() {
@@ -147,8 +218,9 @@ bool Ota::begin() {
 // FIRMWARE_VERSION. Returns Unknown whenever the comparison cannot be established with
 // certainty, and the caller then leaves the OTA request untouched: there is deliberately
 // no fallback to "install latest".
-Ota::VersionStatus Ota::checkVersion(String &remoteVersion) {
+Ota::VersionStatus Ota::checkVersion(String &remoteVersion, String &assetUrl) {
    remoteVersion = "";
+   assetUrl = "";
 
    if (WiFi.status() != WL_CONNECTED) {
       Serial.printf("[%lu] OTA VER: sem Wi-Fi, versao remota nao verificada\n", static_cast<unsigned long>(millis()));
@@ -175,7 +247,11 @@ Ota::VersionStatus Ota::checkVersion(String &remoteVersion) {
 
    // TLS profile identical to the Telegram/ThingsBoard clients, which is proven to fit the
    // heap during normal operation: this check runs while both of them are connected.
+   stackThunkDiag("ota:ver:pre-client"); // (2) antes do construtor do cliente TLS da OTA
+
    WiFiClientSecure client;
+
+   stackThunkDiag("ota:ver:pos-client"); // (2) depois do construtor
    client.setInsecure();
    client.setTimeout(OTA_VERSION_TIMEOUT_MS);
    client.setBufferSizes(4096, 512);
@@ -252,12 +328,15 @@ Ota::VersionStatus Ota::checkVersion(String &remoteVersion) {
       if (bodyLength == 0 || bodyLength > OTA_VERSION_BODY_MAX) {
          Serial.printf("OTA VER: corpo inesperado (%u bytes)\n", static_cast<unsigned>(bodyLength));
       } else {
-         // The filter keeps tag_name only: the release notes and the assets array are skipped
-         // while parsing, so the document stays tiny instead of holding the whole JSON.
-         DynamicJsonDocument filter(256);
+         // The filter keeps only the fields the check needs: tag_name and each asset's name/url. The
+         // release notes, the asset bodies and everything else are skipped while parsing, so the
+         // document stays tiny instead of holding the whole JSON.
+         DynamicJsonDocument filter(512);
          filter["tag_name"] = true;
+         filter["assets"][0]["name"] = true;
+         filter["assets"][0]["url"] = true;
 
-         DynamicJsonDocument doc(256);
+         DynamicJsonDocument doc(1024);
          const DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
 
          if (err) {
@@ -277,7 +356,15 @@ Ota::VersionStatus Ota::checkVersion(String &remoteVersion) {
                Serial.printf("OTA VER: tag_name invalido (\"%.32s\")\n", tag);
             } else {
                remoteVersion = String(remote.parts[0]) + "." + remote.parts[1] + "." + remote.parts[2];
-               result = (compareVersions(remote, installed) > 0) ? VersionStatus::UpdateAvailable : VersionStatus::UpToDate;
+               const bool newer = compareVersions(remote, installed) > 0;
+               result = newer ? VersionStatus::UpdateAvailable : VersionStatus::UpToDate;
+
+               if (newer) {
+                  // Resolve the STABLE asset endpoint NOW, from the SAME query. An empty assetUrl
+                  // means the release has no Monitora_DG.bin asset (or it is ambiguous): the caller
+                  // then aborts the update explicitly.
+                  resolveAssetUrl(doc["assets"].as<JsonArray>(), assetUrl);
+               }
             }
          }
       }
@@ -299,40 +386,145 @@ Ota::VersionStatus Ota::checkVersion(String &remoteVersion) {
    http.end();
    client.stop();
 
-   Serial.printf("[%lu] OTA VER: http=%d body=%u mfln=%d free=%u maxblock=%u instalada=%s remota=%s resultado=%s\n", static_cast<unsigned long>(millis()), status,
-                 static_cast<unsigned>(bodyLength), mfln, static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxFreeBlockSize()),
-                 FIRMWARE_VERSION, remoteVersion.isEmpty() ? "-" : remoteVersion.c_str(), versionStatusName(result));
+   Serial.printf("[%lu] OTA VER: http=%d body=%u mfln=%d free=%u maxblock=%u instalada=%s remota=%s resultado=%s asset=%s\n",
+                 static_cast<unsigned long>(millis()), status, static_cast<unsigned>(bodyLength), mfln, static_cast<unsigned>(ESP.getFreeHeap()),
+                 static_cast<unsigned>(ESP.getMaxFreeBlockSize()), FIRMWARE_VERSION, remoteVersion.isEmpty() ? "-" : remoteVersion.c_str(),
+                 versionStatusName(result), assetUrl.isEmpty() ? "-" : assetUrl.c_str());
 
    return result;
 }
 
-bool Ota::run() {
+bool Ota::run(const char *assetUrl) {
+   stackThunkDiag("ota:run:start"); // (3) inicio de Ota::run()
+
    if (WiFi.status() != WL_CONNECTED) {
       return false;
    }
 
+   if (assetUrl == nullptr || assetUrl[0] == '\0') {
+      // Never fall back to the previous download URL: without the persisted asset endpoint there is
+      // nothing safe to download.
+      Serial.println("OTA: endpoint do asset ausente; atualizacao nao iniciada.");
+      return false;
+   }
+
+   logOtaMem("pre-cliente"); // (1) antes de criar o cliente TLS
+
+   stackThunkDiag("ota:pre-cliente"); // (4) imediatamente antes do construtor do cliente TLS da OTA
+
    WiFiClientSecure client;
+
+   stackThunkDiag("ota:pos-cliente"); // (4) imediatamente depois do construtor
    client.setInsecure();
 
-   // GitHub does not serve the asset directly: /releases/latest/download/... answers 302
-   // twice (github.com -> .../download/<tag>/... -> release-assets.githubusercontent.com)
-   // and ESP8266HTTPUpdate disables redirect following by default, so the update could
-   // never start. STRICT is enough: the redirects are 302 and the method is GET.
+   // Reduce ONLY the OTA client's BearSSL buffers. The default RX (16384 data + 325 overhead = 16709 B)
+   // is the dominant heap consumer of the TLS handshake and, when it does not fit in IRAM, falls to
+   // DRAM. 13312 (13637 B with overhead) lowers that peak while staying close to the TLS record
+   // maximum (the CDN does not negotiate MFLN). Telegram and ThingsBoard keep their own clients and
+   // buffer sizes untouched.
+   client.setBufferSizes(13312, 512);
+
+   logOtaMem("pos-buffers"); // (2) depois de configurar os buffers
+
+   HTTPClient http;
+
+   // begin() must precede addHeader(): begin() -> beginInternal() -> clear() wipes the request headers.
+   if (!http.begin(client, String(assetUrl))) {
+      client.stop();
+      Serial.println("OTA: http.begin falhou (endpoint do asset invalido)");
+      return false;
+   }
+
+   // The asset API endpoint answers the BINARY (302 -> CDN) only with this header; without it the API
+   // returns the asset JSON metadata (HTTP 200) and the update would fail with a wrong HTTP code.
+   // handleUpdate() appends its own x-ESP8266-* headers but never clears this one, and the 302 is
+   // followed by HTTPClient in STRICT mode. NO Authorization is added: the PAT must never travel to
+   // github.com or to the CDN.
+   http.addHeader("Accept", "application/octet-stream");
+
+   // GitHub's asset endpoint answers 302 to release-assets.githubusercontent.com; ESP8266HTTPUpdate
+   // disables redirect following by default, so STRICT is required (the redirects are 302 and the
+   // method is GET).
    ESPhttpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-   // This client keeps the BearSSL default buffers: 16384 + 325 = 16709 B of CONTIGUOUS
-   // RAM (~16.7 kB). Shrinking them with MFLN was tried and failed: the MFLN probe only
-   // covers the URL host (github.com), while GitHub answers 302 and the body is served by
-   // release-assets.githubusercontent.com, which does not negotiate MFLN - so a smaller
-   // buffer ended with BR_ERR_TOO_LARGE (incoming record larger than the buffer) after
-   // ~44 kB. main.cpp therefore runs ota.run() from runPendingOtaIfRequested() on a clean
-   // boot, before Telegram and ThingsBoard exist, so the default buffer fits.
-   //
-   // Operational diagnostic: heap right before the OTA client connects.
-   Serial.printf("OTA HEAP: free=%u maxblock=%u\n", ESP.getFreeHeap(), ESP.getMaxFreeBlockSize());
+   logOtaMem("pre-update"); // (3) imediatamente antes de ESPhttpUpdate.update()
 
-   t_httpUpdate_return result =
-      ESPhttpUpdate.update(client, OTA_FIRMWARE_URL);
+   stackThunkDiag("ota:pre-update"); // (5) imediatamente antes de ESPhttpUpdate.update()
+
+   // Complementary heap guard (NOT a guarantee against later allocation failures): the BearSSL
+   // handshake performs THROWING C++ allocations (make_shared<br_ssl_client_context> ~3424 B and
+   // <br_x509_insecure_context> ~1496 B). This core's operator new calls __unhandled_exception("OOM")
+   // directly (abi.cpp; the build uses -fno-exceptions), so an out-of-memory there is a PANIC and can
+   // NOT be caught. If the largest free block cannot even fit the SSL context, abort the attempt
+   // gracefully instead of risking the panic.
+   const uint32_t maxBlock = ESP.getMaxFreeBlockSize();
+   if (maxBlock < OTA_TLS_MIN_BLOCK) {
+      Serial.printf("[%lu] OTA: heap insuficiente (maxblock=%u < %u); atualizacao nao iniciada\n", static_cast<unsigned long>(millis()),
+                    static_cast<unsigned>(maxBlock), static_cast<unsigned>(OTA_TLS_MIN_BLOCK));
+      http.end();
+      client.stop();
+      return false;
+   }
+
+   // --- Diagnostic instrumentation (read-only observers; they NEVER change the transfer) -----------
+   // The OTA client pointer is valid ONLY between here and the clear after update() returns. The host
+   // is logged (no tokens, no signed URLs) for the current step.
+   Serial.printf("[%lu] OTA: download host=%s\n", static_cast<unsigned long>(millis()), urlHost(String(assetUrl)).c_str());
+
+   g_otaClient = &client;
+   g_otaStartMs = millis();
+   g_otaLastLogged = 0;
+
+   // onStart fires once the FINAL response was HTTP 200 with Content-Length > 0 and enough flash
+   // space (i.e. the API 302 was followed and the CDN answered). The total size is NOT known here
+   // (Update.begin has not run yet): it is reported by the first onProgress(0, total).
+   ESPhttpUpdate.onStart([]() {
+      Serial.printf("[%lu] OTA: corpo iniciado (HTTP 200 aceito); mfln=%d\n", static_cast<unsigned long>(millis() - g_otaStartMs),
+                    g_otaClient ? g_otaClient->getMFLNStatus() : -1);
+   });
+
+   // onProgress: `current` = bytes already written to flash (= received); `total` = Content-Length.
+   // Logged at the start, every ~16 KB and on the final sample, bounding the log volume.
+   ESPhttpUpdate.onProgress([](int current, int total) {
+      if (current == 0 || current >= static_cast<int>(g_otaLastLogged + 16384u) || current == total) {
+         Serial.printf("[%lu] OTA: progresso %d/%d bytes\n", static_cast<unsigned long>(millis() - g_otaStartMs), current, total);
+         g_otaLastLogged = static_cast<uint32_t>(current);
+      }
+   });
+
+   ESPhttpUpdate.onEnd([]() {
+      Serial.printf("[%lu] OTA: transferencia concluida (%u bytes)\n", static_cast<unsigned long>(millis() - g_otaStartMs),
+                    static_cast<unsigned>(Update.progress()));
+   });
+
+   // Registered on the Updater (NOT ESPhttpUpdate): this fires the instant writeStream() sets the
+   // stream error, while the TLS client and its BearSSL engine are still alive, so getLastSSLError()
+   // is valid (it reads _sc/_eng, which http.end() frees). sslCode == 0 means NO TLS error was found.
+   Update.onError([](int err) {
+      char sslMsg[96] = {0};
+      const int sslCode = g_otaClient ? g_otaClient->getLastSSLError(sslMsg, sizeof(sslMsg)) : 0;
+      Serial.printf("[%lu] OTA: update_error=%d progresso=%u bytes\n", static_cast<unsigned long>(millis() - g_otaStartMs), err,
+                    static_cast<unsigned>(Update.progress()));
+      if (sslCode != 0) {
+         Serial.printf("[%lu] OTA: BearSSL ERRO codigo=%d \"%s\"\n", static_cast<unsigned long>(millis() - g_otaStartMs), sslCode, sslMsg);
+      } else {
+         Serial.printf("[%lu] OTA: BearSSL sem erro TLS (codigo 0)\n", static_cast<unsigned long>(millis() - g_otaStartMs));
+      }
+   });
+   // --- end diagnostic instrumentation --------------------------------------------------------------
+
+   // handleUpdate() (called by update()) ends the HTTPClient on EVERY return path, so the socket is
+   // always closed; the client we passed keeps its TLS profile (insecure, reduced buffers).
+   const t_httpUpdate_return result = ESPhttpUpdate.update(http);
+
+   // Defensive and idempotent: end() on an already-ended client only stops the socket again, and
+   // client.stop() is a no-op once stopped. Guarantees closure on every execution path.
+   http.end();
+   client.stop();
+
+   g_otaClient = nullptr; // never leave the callback pointer dangling after the operation
+
+   logOtaMem("pos-update"); // (4) depois do retorno da atualizacao (sucesso ou falha)
 
    switch (result) {
       case HTTP_UPDATE_FAILED:

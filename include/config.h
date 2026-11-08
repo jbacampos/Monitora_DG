@@ -6,7 +6,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-constexpr char FIRMWARE_VERSION[] = "1.6.2";
+constexpr char FIRMWARE_VERSION[] = "1.6.1";
 constexpr char DEVICE_ID[] = "DG-01";
 
 // -----------------------------------------------------------------------------
@@ -79,6 +79,10 @@ constexpr uint32_t OTA_VERSION_CONNECT_TIMEOUT_MS = 3000;
 // Sanity cap for the release JSON (the live reply is ~3.3 kB). A larger body is treated as
 // "could not verify" instead of being parsed.
 constexpr size_t OTA_VERSION_BODY_MAX = 16384;
+
+// Exact name of the release asset that carries the firmware binary. /ota selects EXCLUSIVELY the
+// asset with this name (using its API URL, assets[].url) as the OTA download endpoint.
+constexpr char OTA_ASSET_NAME[] = "Monitora_DG.bin";
 
 constexpr uint32_t ALIVE_INTERVAL_MS = 300000; // local alive, ~5 min
 constexpr uint32_t TB_HEARTBEAT_MS   = 60000;  // supervision heartbeat, ~60 s

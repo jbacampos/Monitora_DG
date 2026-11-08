@@ -229,6 +229,11 @@ struct StickerEditQueue {
    }
 };
 
+// Maximum length (including the terminating NUL) of the STABLE asset API endpoint URL persisted so
+// the OTA boot can download without re-querying the release. The live URL is ~76 chars; 128 leaves a
+// safe margin for a longer owner/repo.
+constexpr size_t OTA_ASSET_URL_MAX = 128;
+
 struct PersistedState {
    bool validReliable = false;
    PowerState power{};
@@ -301,6 +306,16 @@ struct PersistedState {
    StickerEvent fallMaint{};
    StickerEvent returnMaint{};
    StickerEditQueue editQueue{};
+
+   // --- Appended by firmware 1.6.3 (/ota via the GitHub asset API endpoint) ---
+   //
+   // STABLE asset API URL ("https://api.github.com/.../releases/assets/<id>") resolved from
+   // /releases/latest by /ota, so the OTA boot downloads from that endpoint (small headers, a single
+   // 302 to the CDN) instead of the github.com redirect chain (which carries a ~4 KB
+   // Content-Security-Policy). It is NEVER the temporary signed CDN URL. Appended at the END to keep
+   // every earlier field offset; a legacy image leaves it empty and the OTA boot aborts explicitly
+   // (it never falls back to the previous download URL).
+   char otaAssetUrl[OTA_ASSET_URL_MAX] = {0};
 };
 
 // Reason of a boot/reboot. The CODE is the STABLE value published (as a NUMBER) to ThingsBoard

@@ -486,7 +486,8 @@ namespace {
          // client exists. The Telegram offset is persisted first so the same /ota update is
          // not delivered again after the reset.
          String remoteVersion;
-         const Ota::VersionStatus version = ota.checkVersion(remoteVersion);
+         String assetUrl;
+         const Ota::VersionStatus version = ota.checkVersion(remoteVersion, assetUrl);
 
          if (version == Ota::VersionStatus::Unknown) {
             Serial.println("OTA: versao remota indisponivel; atualizacao nao iniciada.");
@@ -494,12 +495,20 @@ namespace {
          } else if (version == Ota::VersionStatus::UpToDate) {
             Serial.printf("OTA: ja atualizado (instalada=%s remota=%s)\n", FIRMWARE_VERSION, remoteVersion.c_str());
             telegram.sendText(String("Monitora_DG já está atualizado.\nVersão: ") + FIRMWARE_VERSION);
+         } else if (assetUrl.isEmpty()) {
+            // The release is newer but does not carry the expected firmware asset (or it is
+            // ambiguous). Abort WITHOUT touching the persisted OTA state and without restarting.
+            Serial.printf("OTA: release %s sem o asset %s (ou ambiguo); atualizacao nao iniciada.\n", remoteVersion.c_str(), OTA_ASSET_NAME);
+            telegram.sendText(String("A release ") + remoteVersion + " não contém o arquivo " + OTA_ASSET_NAME + ". Atualização não iniciada.");
          } else {
             Serial.printf("OTA: nova versao disponivel %s (instalada %s)\n", remoteVersion.c_str(), FIRMWARE_VERSION);
             telegram.sendText(String("Nova versão disponível: ") + remoteVersion + " (instalada: " + FIRMWARE_VERSION + "). Reiniciando para atualizar.");
 
             persisted.tgUpdateOffset = telegram.updateOffset();
             persisted.otaRequested = true;
+            // Persist the STABLE asset API endpoint (never the temporary signed CDN URL) so the OTA
+            // boot downloads from it instead of the github.com redirect chain.
+            snprintf(persisted.otaAssetUrl, sizeof(persisted.otaAssetUrl), "%s", assetUrl.c_str());
             // Mark THIS reboot as the OTA one, so the boot that runs the update (and the clean boot
             // after it) reports "Atualização OTA" instead of the generic "/reboot".
             persisted.pendingBootReason = BOOT_REASON_OTA;
@@ -993,6 +1002,16 @@ namespace {
          return;
       }
 
+      // The OTA boot uses the asset endpoint resolved by /ota. It must never fall back to the
+      // previous download URL: if the persisted endpoint is missing, abort explicitly.
+      if (persisted.otaAssetUrl[0] == '\0') {
+         persisted.otaRequested = false;
+         persisted.pendingBootReason = BOOT_REASON_NONE;
+         saveState();
+         Serial.println("OTA: endpoint do asset ausente no estado persistido; atualizacao nao iniciada.");
+         return;
+      }
+
       const uint32_t waitStart = millis();
 
       while (!wifi.connected() && (millis() - waitStart) < OTA_BOOT_WIFI_WAIT_MS) {
@@ -1018,7 +1037,7 @@ namespace {
 
       Serial.printf("[%lu] OTA: solicitacao pendente, executando no boot limpo\n", static_cast<unsigned long>(millis()));
 
-      ota.run();
+      ota.run(persisted.otaAssetUrl);
 
       // Only reached when the update did NOT reboot the device, i.e. it failed: report it
       // and let the normal boot continue, with no marker that could claim a successful OTA.
@@ -1088,6 +1107,12 @@ void setup() {
 
    Serial.println();
    Serial.println("Boot Monitora_DG");
+
+   // Instrumentation round: capture stack-thunk refcount/pointer at the very start of setup().
+   // A non-zero refcnt / non-null stack_thunk_ptr here proves the 6200 B thunk was already
+   // allocated during static initialisation (i.e. by a file-scope WiFiClientSecure global),
+   // before any service init - the key measurement for closing the heap accounting.
+   stackThunkDiag("setup:start");
 
    heapDiag("setup:boot");
 

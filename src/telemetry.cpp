@@ -15,6 +15,11 @@ namespace {
 } // namespace
 
 bool Telemetry::begin() {
+   // Instrumentation round: the file-scope `tlsClient` global above is constructed during static
+   // initialisation (before setup()), so its constructor is the prime suspect for the FIRST
+   // stack_thunk_add_ref() (6200 B). This snapshot documents the thunk state already observed here.
+   stackThunkDiag("telemetry:begin");
+
    tlsClient.setInsecure();
    tlsClient.setTimeout(1500);
 

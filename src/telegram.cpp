@@ -5,6 +5,7 @@
 #include <WiFiClientSecure.h>
 
 #include "config.h"
+#include "heap_diag.h"
 #include "secrets.h"
 #include "tg_commands.h"
 
@@ -126,8 +127,11 @@ namespace {
          dropTgConnection();
       }
 
+      stackThunkDiag("tg:pre-client"); // (2) antes do construtor do cliente TLS do Telegram
+
       WiFiClientSecure *client = new WiFiClientSecure();
 
+      stackThunkDiag("tg:pos-client"); // (2) depois do construtor
       client->setInsecure();
       client->setTimeout(TELEGRAM_RESPONSE_TIMEOUT_MS);
       client->setBufferSizes(4096, 512);
